@@ -2,10 +2,11 @@
 多目的ハイパーパラメータ最適化（Optuna NSGA-II）。
 
 目的関数（すべて最小化）:
-  1. rmse_open          : 翌日始値変化率の RMSE
-  2. rmse_close         : 翌日終値変化率の RMSE
-  3. 1_minus_dir_acc_open  : 始値方向的中率の補数（= 1 - 的中率）
-  4. 1_minus_dir_acc_close : 終値方向的中率の補数
+  1. rmse_open               : 翌日始値変化率の RMSE
+  2. rmse_close              : 翌日終値変化率の RMSE
+  3. 1_minus_dir_acc_open    : 始値方向的中率の補数（= 1 - 的中率）
+  4. 1_minus_dir_acc_close   : 終値方向的中率の補数
+  5. neg_n_recommendations   : 推薦通過銘柄数の負値（最小化 = 推薦数を最大化）
 
 探索空間:
   LightGBM モデルパラメータ（学習率・木の複雑さ・正則化など）
@@ -30,6 +31,7 @@ import config
 from src.features.engineer import load_processed
 from src.models.train import train, _save_models
 from src.models.metrics import compute_errors, PredictionErrors
+from src.models.predict import predict_next_day
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +73,33 @@ def _suggest_params(trial: optuna.Trial, lgbm_n_jobs: int = 1) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 推薦数カウント
+# ---------------------------------------------------------------------------
+
+def _count_recommendations(
+    features: dict[str, pd.DataFrame],
+    model_open,
+    model_close,
+) -> int:
+    """
+    現在の特徴量に対して MIN_EXPECTED_GAIN_PCT フィルタを通過する銘柄数を返す。
+
+    predict_next_day は各銘柄の最終行を使って翌日を予測する。
+    推薦フィルタのうちモデルの予測値に依存する expected_gain_pct のみを適用する
+    （出来高・騰落率は銘柄固有のデータであり、モデルパラメータに依存しない）。
+    """
+    try:
+        preds = predict_next_day(features, model_open, model_close)
+        n_recs = int(
+            (preds["expected_gain_pct"] >= config.MIN_EXPECTED_GAIN_PCT).sum()
+        )
+        return n_recs
+    except Exception as exc:
+        logger.debug("推薦数カウント中にエラー: %s", exc)
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # 目的関数
 # ---------------------------------------------------------------------------
 
@@ -78,18 +107,20 @@ def _objective(
     trial: optuna.Trial,
     features: dict[str, pd.DataFrame],
     lgbm_n_jobs: int = 1,
-) -> tuple[float, float, float, float]:
+) -> tuple[float, float, float, float, float]:
     """
     1 Trial の評価。
 
     1. ハイパーパラメータをサンプリング
     2. モデルを学習（保存しない）
-    3. バリデーション期間の誤差を計算して返す
+    3. バリデーション期間の誤差を計算
+    4. 推薦フィルタを通過する銘柄数を計算
 
     Returns
     -------
-    tuple[float, float, float, float]
-        (rmse_open, rmse_close, 1-dir_acc_open, 1-dir_acc_close)
+    tuple[float, float, float, float, float]
+        (rmse_open, rmse_close, 1-dir_acc_open, 1-dir_acc_close, neg_n_recommendations)
+        neg_n_recommendations: 推薦数の負値（最小化 = 推薦数を最大化）
     """
     params = _suggest_params(trial, lgbm_n_jobs=lgbm_n_jobs)
 
@@ -108,12 +139,15 @@ def _objective(
         if any(v != v for v in errors.objectives.values()):  # nan check
             raise optuna.TrialPruned()
 
+        n_recs = _count_recommendations(features, model_open, model_close)
+
         objs = errors.objectives
         return (
             objs["rmse_open"],
             objs["rmse_close"],
             objs["1_minus_dir_acc_open"],
             objs["1_minus_dir_acc_close"],
+            -float(n_recs),  # 負値 = 推薦数最大化
         )
 
     except optuna.TrialPruned:
@@ -182,7 +216,7 @@ def run_optimization(
 
     # Study の作成
     sampler = optuna.samplers.NSGAIISampler(seed=42)
-    directions = ["minimize", "minimize", "minimize", "minimize"]
+    directions = ["minimize", "minimize", "minimize", "minimize", "minimize"]
 
     study = optuna.create_study(
         study_name=study_name,
@@ -197,6 +231,7 @@ def run_optimization(
         "rmse_close",
         "1_minus_dir_acc_open",
         "1_minus_dir_acc_close",
+        "neg_n_recommendations",  # 負値（小さいほど推薦数が多い）
     ]
     study.set_metric_names(objective_names)
 
@@ -264,15 +299,36 @@ def _build_pareto_df(
 def _select_best_params(
     pareto: pd.DataFrame, objective_names: list[str]
 ) -> dict | None:
-    """Pareto 最前線の中から rmse_open + rmse_close が最小の点を選ぶ。"""
+    """
+    Pareto 最前線から最適パラメータを選択する。
+
+    選択基準:
+      1. 推薦数 >= MIN_RECS_THRESHOLD を満たす Trial を優先
+      2. その中で rmse_open + rmse_close が最小の点を選ぶ
+      3. 該当なければ全 Pareto 最前線から推薦数を加味した複合スコアで選ぶ
+    """
     if pareto.empty:
         return None
-    score_col = "score"
+
+    # neg_n_recommendations が存在する場合は推薦数フィルタを適用
+    MIN_RECS_THRESHOLD = 5  # 最低限この銘柄数以上の推薦が欲しい
+
     pareto = pareto.copy()
-    pareto[score_col] = (
-        pareto["obj_rmse_open"] + pareto["obj_rmse_close"]
-    )
-    best_row = pareto.loc[pareto[score_col].idxmin()]
+    if "obj_neg_n_recommendations" in pareto.columns:
+        pareto["n_recs"] = (-pareto["obj_neg_n_recommendations"]).clip(lower=0)
+        qualified = pareto[pareto["n_recs"] >= MIN_RECS_THRESHOLD]
+        pool = qualified if not qualified.empty else pareto
+        logger.info(
+            "Pareto 最前線: %d 点中 推薦数 >= %d の点: %d 点",
+            len(pareto), MIN_RECS_THRESHOLD, len(qualified),
+        )
+    else:
+        pool = pareto
+
+    score_col = "score"
+    pool = pool.copy()
+    pool[score_col] = pool["obj_rmse_open"] + pool["obj_rmse_close"]
+    best_row = pool.loc[pool[score_col].idxmin()]
 
     # param_ プレフィックスを除いて返す
     params = {
