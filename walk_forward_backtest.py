@@ -23,9 +23,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+import json
 import config
 from src.models.train import train, MODEL_OPEN_PATH, MODEL_CLOSE_PATH
 from src.models.predict import predict_next_day
+
+# best_params.json が存在すればロードしてウォークフォワードに使用する
+_best_params_path = config.BASE_DIR / "best_params.json"
+if _best_params_path.exists():
+    _best_params = json.loads(_best_params_path.read_text(encoding="utf-8"))
+    print(f"best_params.json を使用します: {_best_params_path}")
+else:
+    _best_params = None
+    print("best_params.json が見つかりません。デフォルトパラメータを使用します。")
 
 # ---------------------------------------------------------------------------
 # 1. 全特徴量・rawデータを一括読み込み
@@ -92,6 +102,7 @@ for i, target_date in enumerate(target_dates):
         train_features,
         force=True,
         save=False,
+        params=_best_params,  # None の場合は config.LGBM_PARAMS を使用
     )
 
     # ---- 予測用: date <= T-1 の行のみ（最終行が T-1 になる） ----
