@@ -63,6 +63,11 @@ def parse_args() -> argparse.Namespace:
         "--n-jobs", type=int, default=1,
         help="最適化の並列 Trial 数（デフォルト: 1）。CPU コア数の半分程度を推奨。"
     )
+    parser.add_argument(
+        "--storage", type=str, default=None,
+        help='Optuna ストレージ URL（例: "sqlite:///optuna.db"）。'
+             'n_jobs > 1 の場合は自動で SQLite を使用するため省略可。',
+    )
     parser.add_argument("--apply-best", action="store_true",
                         help="最適化済みパラメータで本番モデルを再学習")
     parser.add_argument(
@@ -117,7 +122,13 @@ def main() -> None:
             sys.exit(1)
         logger.info("[Step 4a] 多目的ハイパーパラメータ最適化を実行します")
         n_tickers = args.n_tickers if args.n_tickers > 0 else None
-        run_optimization(features, n_trials=args.n_trials, n_tickers=n_tickers, n_jobs=args.n_jobs)
+        run_optimization(
+            features,
+            n_trials=args.n_trials,
+            n_tickers=n_tickers,
+            n_jobs=args.n_jobs,
+            storage=args.storage,
+        )
         logger.info("最適化完了。結果: optuna_results/ / 推薦パラメータ: best_params.json")
 
     # ------------------------------------------------------------------ #

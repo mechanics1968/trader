@@ -220,6 +220,13 @@ def run_optimization(
         n_jobs, cpu_count, lgbm_n_jobs,
     )
 
+    # n_jobs > 1 の場合はストレージが必須（NSGAIISampler の並列安全性のため）
+    if n_jobs > 1 and storage is None:
+        storage = f"sqlite:///{config.BASE_DIR / 'optuna.db'}"
+        logger.warning(
+            "n_jobs > 1 には永続ストレージが必要です。自動的に SQLite を使用します: %s", storage
+        )
+
     # Study の作成
     sampler = optuna.samplers.NSGAIISampler(seed=42)
     directions = ["minimize", "minimize", "minimize", "minimize", "minimize"]
