@@ -27,14 +27,22 @@ import json
 import config
 from src.models.train import train, MODEL_OPEN_PATH, MODEL_CLOSE_PATH
 from src.models.predict import predict_next_day
+from src.models.optimize import OPT_NUM_ROUNDS, OPT_EARLY_STOPPING
 
 # best_params.json が存在すればロードしてウォークフォワードに使用する
+# 最適化は固定ラウンド数（OPT_NUM_ROUNDS=50、early stopping なし）で評価しているため、
+# ここでも同じ設定を使い、最適化と評価の一貫性を保つ。
 _best_params_path = config.BASE_DIR / "best_params.json"
 if _best_params_path.exists():
     _best_params = json.loads(_best_params_path.read_text(encoding="utf-8"))
+    _num_rounds     = OPT_NUM_ROUNDS       # 最適化と同じ固定ラウンド数（50）
+    _early_stopping = OPT_EARLY_STOPPING   # 最適化と同じ（None = 無効）
     print(f"best_params.json を使用します: {_best_params_path}")
+    print(f"  学習設定: num_rounds={_num_rounds}, early_stopping={_early_stopping}")
 else:
-    _best_params = None
+    _best_params    = None
+    _num_rounds     = config.LGBM_NUM_ROUNDS
+    _early_stopping = config.LGBM_EARLY_STOPPING
     print("best_params.json が見つかりません。デフォルトパラメータを使用します。")
 
 # ---------------------------------------------------------------------------
@@ -102,7 +110,9 @@ for i, target_date in enumerate(target_dates):
         train_features,
         force=True,
         save=False,
-        params=_best_params,  # None の場合は config.LGBM_PARAMS を使用
+        params=_best_params,           # None の場合は config.LGBM_PARAMS を使用
+        num_rounds=_num_rounds,         # best_params 使用時は最適化と同じ固定50ラウンド
+        early_stopping=_early_stopping, # best_params 使用時は None（無効）
     )
 
     # ---- 予測用: date <= T-1 の行のみ（最終行が T-1 になる） ----
