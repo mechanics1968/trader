@@ -330,8 +330,16 @@ class TFTModelWrapper:
         (y_pred, y_actual) : tuple[np.ndarray, np.ndarray]
             どちらも shape=(N,) の 1D 配列
         """
+        # 学習時に見た銘柄のみで評価（未知銘柄は NaNLabelEncoder で壊れた予測が生成されるため除外）
+        known_tickers = set(self.training_dataset.decoded_index["ticker"].unique())
+        features_known = {k: v for k, v in features.items() if k in known_tickers}
+        if not features_known:
+            logger.warning("compute_val_predictions: 既知銘柄が 0 件です")
+            return np.array([]), np.array([])
+        logger.info("compute_val_predictions: %d / %d 銘柄を評価", len(features_known), len(features))
+
         val_long_df = _extract_val_context(
-            features,
+            features_known,
             self.target_col,
             self.feat_cols,
             n_val_days,
