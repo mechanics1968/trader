@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod:*)",
+      "Bash(conda run:*)",
+      "Bash(kill:*)",
+      "Bash(python3:*)",
+      "WebFetch(domain:pytorch-forecasting.readthedocs.io)",
+      "WebFetch(domain:nixtla.github.io)",
+      "WebSearch",
+      "WebFetch(domain:nixtlaverse.nixtla.io)",
+      "Bash(ls:*)",
+      "Bash(echo:*)"
+    ]
+  }
+}

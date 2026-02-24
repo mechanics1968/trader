@@ -1,0 +1,409 @@
+"""
+多目的ハイパーパラメータ最適化（Optuna NSGA-II）。
+
+目的関数（すべて最小化）:
+  1. rmse_open          : 翌日始値変化率の RMSE
+  2. rmse_close         : 翌日終値変化率の RMSE
+  3. 1_minus_dir_acc_open  : 始値方向的中率の補数（= 1 - 的中率）
+  4. 1_minus_dir_acc_close : 終値方向的中率の補数
+
+探索空間:
+  LightGBM モデルパラメータ（学習率・木の複雑さ・正則化など）
+
+実行例:
+  python -m src.models.optimize --n-trials 50 --n-tickers 300
+  python -m src.models.optimize --n-trials 300 --n-tickers 300 --n-jobs 4
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import random
+from pathlib import Path
+
+import optuna
+import pandas as pd
+
+import config
+from src.features.engineer import load_processed
+from src.models.train import train, _save_models
+from src.models.metrics import compute_errors, PredictionErrors
+
+logger = logging.getLogger(__name__)
+
+# 最適化結果の保存先
+OPTUNA_RESULTS_DIR = config.BASE_DIR / "optuna_results"
+BEST_PARAMS_PATH = config.BASE_DIR / "best_params.json"
+
+# 最適化中の学習設定（通常学習より軽量に）
+OPT_NUM_ROUNDS = 300
+OPT_EARLY_STOPPING = 30
+
+
+# ---------------------------------------------------------------------------
+# 探索空間の定義
+# ---------------------------------------------------------------------------
+
+def _suggest_params(trial: optuna.Trial, lgbm_n_jobs: int = 1) -> dict:
+    """Optuna の Trial からハイパーパラメータをサンプリングする。"""
+    return {
+        "objective": "regression",
+        "metric": "rmse",
+        "verbose": -1,
+        "n_jobs": lgbm_n_jobs,
+        # --- 学習率 ---
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+        # --- 木の複雑さ ---
+        "num_leaves": trial.suggest_int("num_leaves", 15, 255),
+        "max_depth": trial.suggest_int("max_depth", 3, 12),
+        "min_child_samples": trial.suggest_int("min_child_samples", 10, 100),
+        "min_gain_to_split": trial.suggest_float("min_gain_to_split", 0.0, 1.0),
+        # --- サンプリング ---
+        "feature_fraction": trial.suggest_float("feature_fraction", 0.4, 1.0),
+        "bagging_fraction": trial.suggest_float("bagging_fraction", 0.4, 1.0),
+        "bagging_freq": trial.suggest_int("bagging_freq", 1, 10),
+        # --- 正則化 ---
+        "lambda_l1": trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True),
+        "lambda_l2": trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 目的関数
+# ---------------------------------------------------------------------------
+
+def _objective(
+    trial: optuna.Trial,
+    features: dict[str, pd.DataFrame],
+    lgbm_n_jobs: int = 1,
+) -> tuple[float, float, float, float]:
+    """
+    1 Trial の評価。
+
+    1. ハイパーパラメータをサンプリング
+    2. モデルを学習（保存しない）
+    3. バリデーション期間の誤差を計算して返す
+
+    Returns
+    -------
+    tuple[float, float, float, float]
+        (rmse_open, rmse_close, 1-dir_acc_open, 1-dir_acc_close)
+    """
+    params = _suggest_params(trial, lgbm_n_jobs=lgbm_n_jobs)
+
+    try:
+        model_open, model_close = train(
+            features,
+            force=True,
+            params=params,
+            num_rounds=OPT_NUM_ROUNDS,
+            early_stopping=OPT_EARLY_STOPPING,
+            save=False,
+        )
+        errors = compute_errors(features, model_open, model_close)
+
+        # NaN が出た場合は最悪値を返して枝刈り
+        if any(v != v for v in errors.objectives.values()):  # nan check
+            raise optuna.TrialPruned()
+
+        objs = errors.objectives
+        return (
+            objs["rmse_open"],
+            objs["rmse_close"],
+            objs["1_minus_dir_acc_open"],
+            objs["1_minus_dir_acc_close"],
+        )
+
+    except optuna.TrialPruned:
+        raise
+    except Exception as exc:
+        logger.warning("Trial %d 失敗: %s", trial.number, exc)
+        raise optuna.TrialPruned()
+
+
+# ---------------------------------------------------------------------------
+# 最適化の実行
+# ---------------------------------------------------------------------------
+
+def run_optimization(
+    features: dict[str, pd.DataFrame],
+    n_trials: int = 50,
+    n_tickers: int | None = None,
+    study_name: str = "trader_lgbm",
+    storage: str | None = None,
+    n_jobs: int = 1,
+) -> optuna.Study:
+    """
+    多目的ハイパーパラメータ最適化を実行する。
+
+    Parameters
+    ----------
+    features : dict[str, pd.DataFrame]
+        {ticker: 特徴量 DataFrame}（全銘柄）
+    n_trials : int
+        試行回数
+    n_tickers : int | None
+        最適化に使う銘柄数（None = 全銘柄）。
+        全銘柄だと1 Trial が重いため、速度重視なら 300〜500 を推奨。
+    study_name : str
+        Optuna Study の名前（ストレージを使う場合に識別子になる）
+    storage : str | None
+        Optuna のストレージ URL（例: "sqlite:///optuna.db"）。
+        None の場合はインメモリで実行（結果は揮発する）。
+    n_jobs : int
+        Optuna の並列 Trial 数。各 Trial の LightGBM スレッド数を自動調整する。
+        cpu_count // n_jobs コアを LightGBM に割り当てる（デフォルト: 1）。
+
+    Returns
+    -------
+    optuna.Study
+        完了した Study オブジェクト
+    """
+    OPTUNA_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 銘柄数を絞る（速度重視モード）
+    if n_tickers is not None and n_tickers < len(features):
+        sampled_keys = random.sample(list(features.keys()), n_tickers)
+        opt_features = {k: features[k] for k in sampled_keys}
+        logger.info("最適化用に %d / %d 銘柄をサンプリングします", n_tickers, len(features))
+    else:
+        opt_features = features
+
+    # 並列 Trial 数に応じて LightGBM の per-Trial スレッド数を決定
+    # 例: 8コア / n_jobs=4 → 各 Trial に 2 スレッド → 合計 8 コアをフル活用
+    cpu_count = os.cpu_count() or 4
+    lgbm_n_jobs = max(1, cpu_count // max(1, n_jobs))
+    logger.info(
+        "並列 Trial: %d / CPU: %d コア / LightGBM per-Trial スレッド: %d",
+        n_jobs, cpu_count, lgbm_n_jobs,
+    )
+
+    # Study の作成
+    sampler = optuna.samplers.NSGAIISampler(seed=42)
+    directions = ["minimize", "minimize", "minimize", "minimize"]
+
+    study = optuna.create_study(
+        study_name=study_name,
+        directions=directions,
+        sampler=sampler,
+        storage=storage,
+        load_if_exists=(storage is not None),
+    )
+
+    objective_names = [
+        "rmse_open",
+        "rmse_close",
+        "1_minus_dir_acc_open",
+        "1_minus_dir_acc_close",
+    ]
+    study.set_metric_names(objective_names)
+
+    logger.info(
+        "多目的最適化を開始します（%d trials / %d 銘柄 / NSGA-II / n_jobs=%d）",
+        n_trials, len(opt_features), n_jobs,
+    )
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    study.optimize(
+        lambda trial: _objective(trial, opt_features, lgbm_n_jobs=lgbm_n_jobs),
+        n_trials=n_trials,
+        show_progress_bar=(n_jobs == 1),  # 並列時はプログレスバー無効（表示崩れ防止）
+        n_jobs=n_jobs,
+    )
+
+    # 結果の保存と表示
+    _save_results(study, objective_names)
+    _log_pareto_front(study, objective_names)
+
+    return study
+
+
+# ---------------------------------------------------------------------------
+# 結果の保存・表示
+# ---------------------------------------------------------------------------
+
+def _save_results(study: optuna.Study, objective_names: list[str]) -> None:
+    """全 Trial の結果と Pareto 最前線を CSV に保存する。"""
+    # 全 Trial
+    all_trials_path = OPTUNA_RESULTS_DIR / "all_trials.csv"
+    trials_df = study.trials_dataframe()
+    trials_df.to_csv(all_trials_path, index=False)
+    logger.info("全 Trial 結果を保存しました: %s", all_trials_path)
+
+    # Pareto 最前線
+    pareto = _build_pareto_df(study, objective_names)
+    pareto_path = OPTUNA_RESULTS_DIR / "pareto_front.csv"
+    pareto.to_csv(pareto_path, index=False)
+    logger.info("Pareto 最前線を保存しました: %s (%d 件)", pareto_path, len(pareto))
+
+    # 推薦パラメータ（rmse_open + rmse_close の合計が最小の1点）
+    best = _select_best_params(pareto, objective_names)
+    if best is not None:
+        BEST_PARAMS_PATH.write_text(
+            json.dumps(best, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        logger.info("推薦パラメータを保存しました: %s", BEST_PARAMS_PATH)
+
+
+def _build_pareto_df(
+    study: optuna.Study, objective_names: list[str]
+) -> pd.DataFrame:
+    """Pareto 最前線の Trial を DataFrame に変換する。"""
+    rows = []
+    for t in study.best_trials:
+        row = {f"obj_{name}": v for name, v in zip(objective_names, t.values)}
+        row.update({f"param_{k}": v for k, v in t.params.items()})
+        row["trial_number"] = t.number
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _select_best_params(
+    pareto: pd.DataFrame, objective_names: list[str]
+) -> dict | None:
+    """Pareto 最前線の中から rmse_open + rmse_close が最小の点を選ぶ。"""
+    if pareto.empty:
+        return None
+    score_col = "score"
+    pareto = pareto.copy()
+    pareto[score_col] = (
+        pareto["obj_rmse_open"] + pareto["obj_rmse_close"]
+    )
+    best_row = pareto.loc[pareto[score_col].idxmin()]
+
+    # param_ プレフィックスを除いて返す
+    params = {
+        k.removeprefix("param_"): v
+        for k, v in best_row.items()
+        if k.startswith("param_")
+    }
+    # LightGBM に必要な固定キーを追加
+    params.update({"objective": "regression", "metric": "rmse",
+                   "verbose": -1, "n_jobs": -1})
+    # int キャスト
+    for key in ("num_leaves", "max_depth", "min_child_samples", "bagging_freq"):
+        if key in params:
+            params[key] = int(params[key])
+    return params
+
+
+def _log_pareto_front(study: optuna.Study, objective_names: list[str]) -> None:
+    """Pareto 最前線のサマリをログに出力する。"""
+    pareto = _build_pareto_df(study, objective_names)
+    if pareto.empty:
+        logger.warning("Pareto 最前線が空です")
+        return
+
+    obj_cols = [f"obj_{n}" for n in objective_names]
+    logger.info(
+        "\n=== Pareto 最前線 (%d 点) ===\n%s",
+        len(pareto),
+        pareto[["trial_number"] + obj_cols].round(6).to_string(index=False),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 最適化済みパラメータの適用
+# ---------------------------------------------------------------------------
+
+def apply_best_params(
+    features: dict[str, pd.DataFrame],
+    params_path: Path = BEST_PARAMS_PATH,
+) -> tuple:
+    """
+    保存済みの推薦パラメータでモデルを再学習して保存する。
+
+    Parameters
+    ----------
+    features : dict[str, pd.DataFrame]
+        全銘柄の特徴量
+    params_path : Path
+        best_params.json のパス
+
+    Returns
+    -------
+    tuple[lgb.Booster, lgb.Booster]
+    """
+    if not params_path.exists():
+        raise FileNotFoundError(f"推薦パラメータファイルが見つかりません: {params_path}")
+
+    params = json.loads(params_path.read_text(encoding="utf-8"))
+    logger.info("推薦パラメータを適用して再学習します: %s", params)
+
+    model_open, model_close = train(
+        features,
+        force=True,
+        params=params,
+        save=True,
+    )
+    return model_open, model_close
+
+
+# ---------------------------------------------------------------------------
+# CLI エントリポイント
+# ---------------------------------------------------------------------------
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="多目的ハイパーパラメータ最適化")
+    p.add_argument("--n-trials", type=int, default=50, help="試行回数（デフォルト: 50）")
+    p.add_argument(
+        "--n-tickers", type=int, default=0,
+        help="最適化に使う銘柄数（デフォルト: 0=全銘柄）。速度重視なら 300 を指定。"
+    )
+    p.add_argument(
+        "--n-jobs", type=int, default=1,
+        help="並列 Trial 数（デフォルト: 1）。CPU コア数の半分程度を推奨。"
+    )
+    p.add_argument(
+        "--storage", type=str, default=None,
+        help='Optuna ストレージ URL（例: "sqlite:///optuna.db"）'
+    )
+    p.add_argument(
+        "--apply", action="store_true",
+        help="最適化後に推薦パラメータで本番モデルを再学習する"
+    )
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    import sys
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+    args = _parse_args()
+
+    # 特徴量をすべてロード
+    import os
+    from src.features.engineer import load_processed
+
+    logger.info("特徴量を読み込みます ...")
+    features: dict[str, pd.DataFrame] = {}
+    for fname in os.listdir(config.PROCESSED_DIR):
+        if not fname.endswith(".csv"):
+            continue
+        ticker = fname.replace("_T.csv", ".T")
+        df = load_processed(ticker)
+        if df is not None:
+            features[ticker] = df
+    logger.info("%d 銘柄の特徴量を読み込みました", len(features))
+
+    n_tickers = args.n_tickers if args.n_tickers > 0 else None
+
+    study = run_optimization(
+        features,
+        n_trials=args.n_trials,
+        n_tickers=n_tickers,
+        storage=args.storage,
+        n_jobs=args.n_jobs,
+    )
+
+    if args.apply:
+        logger.info("推薦パラメータで本番モデルを再学習します ...")
+        apply_best_params(features)
+        logger.info("完了")
