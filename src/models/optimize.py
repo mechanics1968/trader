@@ -39,9 +39,13 @@ logger = logging.getLogger(__name__)
 OPTUNA_RESULTS_DIR = config.BASE_DIR / "optuna_results"
 BEST_PARAMS_PATH = config.BASE_DIR / "best_params.json"
 
-# 最適化中の学習設定（通常学習より軽量に）
-OPT_NUM_ROUNDS = 300
-OPT_EARLY_STOPPING = 30
+# 最適化中の学習設定
+# Early Stopping を無効化して固定ラウンド数で評価する。
+# 理由: αターゲットは RMSE が round 1〜5 でピークを迎えた後に方向的中率が round 30 で
+#        ピークを迎える（RMSE と方向的中率が相反する）。Early Stopping を使うと
+#        全 Trial が「null モデル」で止まり、ハイパーパラメータの差が検出できない。
+OPT_NUM_ROUNDS = 50    # 固定ラウンド数（方向的中率がピークに近い範囲）
+OPT_EARLY_STOPPING = None  # None = Early Stopping 無効
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +65,9 @@ def _suggest_params(trial: optuna.Trial, lgbm_n_jobs: int = 1) -> dict:
         "num_leaves": trial.suggest_int("num_leaves", 15, 255),
         "max_depth": trial.suggest_int("max_depth", 3, 12),
         "min_child_samples": trial.suggest_int("min_child_samples", 10, 100),
-        "min_gain_to_split": trial.suggest_float("min_gain_to_split", 0.0, 1.0),
+        # 注意: αターゲットは分散が小さく min_gain_to_split >= 0.1 で split が一切
+        # 起きなくなる（定数予測 = null model）。対数スケールで小さな値を探索する。
+        "min_gain_to_split": trial.suggest_float("min_gain_to_split", 1e-8, 0.05, log=True),
         # --- サンプリング ---
         "feature_fraction": trial.suggest_float("feature_fraction", 0.4, 1.0),
         "bagging_fraction": trial.suggest_float("bagging_fraction", 0.4, 1.0),

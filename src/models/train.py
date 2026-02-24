@@ -88,10 +88,13 @@ def train(
         target_cols = ["target_open_return", "target_close_return"]
         logger.warning("残差ターゲット列が見つかりません。通常ターゲットにフォールバックします")
 
+    date_col = combined["date"] if "date" in combined.columns else None
     model_open = _train_single(X, y_open, label=label_open, params=params,
-                               num_rounds=num_rounds, early_stopping=early_stopping)
+                               num_rounds=num_rounds, early_stopping=early_stopping,
+                               date_col=date_col)
     model_close = _train_single(X, y_close, label=label_close, params=params,
-                                num_rounds=num_rounds, early_stopping=early_stopping)
+                                num_rounds=num_rounds, early_stopping=early_stopping,
+                                date_col=date_col)
 
     if save:
         _save_models(model_open, model_close)
@@ -105,6 +108,7 @@ def _train_single(
     params: dict | None = None,
     num_rounds: int = config.LGBM_NUM_ROUNDS,
     early_stopping: int = config.LGBM_EARLY_STOPPING,
+    date_col: pd.Series | None = None,
 ) -> lgb.Booster:
     """
     1ターゲット分の LightGBM モデルを学習する。
@@ -117,21 +121,32 @@ def _train_single(
         最大ブーストラウンド数。
     early_stopping : int
         Early Stopping のラウンド数。
+    date_col : pd.Series | None
+        日付列（combined["date"]）。提供された場合は末尾 VALIDATION_DAYS 日の
+        全銘柄行をValセットとして使用する（位置ベース分割より大きく代表的なValセット）。
+        None の場合は従来の位置ベース分割にフォールバック。
     """
     lgbm_params = params if params is not None else config.LGBM_PARAMS
 
-    # 末尾 VALIDATION_DAYS をバリデーションセットとして使用
     n_val = config.VALIDATION_DAYS
-    X_train, X_val = X.iloc[:-n_val], X.iloc[-n_val:]
-    y_train, y_val = y.iloc[:-n_val], y.iloc[-n_val:]
+    if date_col is not None:
+        # 日付ベース分割: 末尾 n_val 日 × 全銘柄 をValセットとする
+        all_dates = sorted(date_col.unique())
+        val_dates = set(all_dates[-n_val:])
+        val_mask = date_col.isin(val_dates)
+        X_train, X_val = X[~val_mask], X[val_mask]
+        y_train, y_val = y[~val_mask], y[val_mask]
+    else:
+        # フォールバック: 位置ベース分割（date 列なし）
+        X_train, X_val = X.iloc[:-n_val], X.iloc[-n_val:]
+        y_train, y_val = y.iloc[:-n_val], y.iloc[-n_val:]
 
     dtrain = lgb.Dataset(X_train, label=y_train, free_raw_data=False)
     dval = lgb.Dataset(X_val, label=y_val, reference=dtrain, free_raw_data=False)
 
-    callbacks = [
-        lgb.early_stopping(stopping_rounds=early_stopping, verbose=False),
-        lgb.log_evaluation(period=100),
-    ]
+    callbacks = [lgb.log_evaluation(period=100)]
+    if early_stopping is not None and early_stopping > 0:
+        callbacks.insert(0, lgb.early_stopping(stopping_rounds=early_stopping, verbose=False))
 
     model = lgb.train(
         params=lgbm_params,
