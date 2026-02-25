@@ -215,6 +215,12 @@ def run_optimization(
     # 例: 8コア / n_jobs=4 → 各 Trial に 2 スレッド → 合計 8 コアをフル活用
     cpu_count = os.cpu_count() or 4
     lgbm_n_jobs = max(1, cpu_count // max(1, n_jobs))
+
+    # fork + OpenMP の競合による segfault 対策
+    # LightGBM が内部で使う OpenMP スレッド数を明示的に制限する
+    os.environ["OMP_NUM_THREADS"] = str(lgbm_n_jobs)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(lgbm_n_jobs)
+    os.environ["MKL_NUM_THREADS"] = str(lgbm_n_jobs)
     logger.info(
         "並列 Trial: %d / CPU: %d コア / LightGBM per-Trial スレッド: %d",
         n_jobs, cpu_count, lgbm_n_jobs,
