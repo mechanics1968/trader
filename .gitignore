@@ -10,3 +10,5 @@ models_saved/
 results/
 .DS_Store
 *.log
+optuna.db
+slurm-*
