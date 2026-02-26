@@ -118,6 +118,11 @@ TFT_GRADIENT_CLIP: float = 0.1
 TFT_EARLY_STOPPING_PATIENCE: int = 5
 TFT_MODEL_OPEN_DIR: Path = MODELS_DIR / "tft_open"
 TFT_MODEL_CLOSE_DIR: Path = MODELS_DIR / "tft_close"
+# DataLoader の worker 数（0=メインプロセスのみ、>0 で並列ロード）
+# MPS 環境では 0 固定。CUDA 環境では 4〜8 推奨。
+TFT_NUM_WORKERS: int = int(os.getenv("TFT_NUM_WORKERS", "4"))
+# GPU 数に比例して学習率をスケールアップするか（Linear Scaling Rule）
+TFT_LR_SCALE_WITH_GPUS: bool = True
 
 # ---------------------------------------------------------------------------
 # ログ

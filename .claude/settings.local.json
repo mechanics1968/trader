@@ -10,7 +10,14 @@
       "WebSearch",
       "WebFetch(domain:nixtlaverse.nixtla.io)",
       "Bash(ls:*)",
-      "Bash(echo:*)"
+      "Bash(echo:*)",
+      "Bash(python:*)",
+      "Bash(tee $LOG_FILE:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(pkill:*)",
+      "WebFetch(domain:jpx-jquants.com)",
+      "Bash(ps:*)",
+      "Bash(grep:*)"
     ]
   }
 }

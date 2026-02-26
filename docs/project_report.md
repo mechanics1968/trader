@@ -76,12 +76,17 @@ trader/
 - 学習データ: 直近1年分（約250営業日）
 - バリデーション: 最後の20日分（全銘柄 × 20日）を保持
 
-#### Phase 2: TFT - Temporal Fusion Transformer（実装済み・未評価）
+#### Phase 2: TFT - Temporal Fusion Transformer（評価完了・不採用）
 - ライブラリ: pytorch-forecasting v1.x
 - `TimeSeriesDataSet(group_ids=["ticker"])` で全銘柄グローバルモデル
 - `--model tft` フラグで切り替え可能（既存 LightGBM パスは無変更）
-- M1 Mac MPS バックエンド対応（`PYTORCH_ENABLE_MPS_FALLBACK=1`）
-- 学習時間が長いため本格評価は未実施
+- GPU 分散学習: `ddp_spawn`（NVIDIA L40S × 8、NCCL backend）
+- 学習率スケーリング: `1e-3 × 8 GPU = 8e-3`（Linear Scaling Rule）
+- **評価結果（2026-02-25、全銘柄 3,736 銘柄、バリデーション 20 日）**:
+  - 始値方向的中率: **46.7%** / 終値方向的中率: **49.8%**
+  - 推薦銘柄数: **0 件**（期待上昇率フィルタを通過する銘柄なし）
+  - 学習所要時間: 始値モデル Epoch 6（約 13 分）、終値モデル Epoch 10（約 20 分）
+- **判定: LightGBM と同等以下のため不採用。以降は LightGBM を使用する。**
 
 ### 3.4 ハイパーパラメータ最適化（Optuna NSGA-II）
 - 多目的最適化（5目的）:
@@ -195,9 +200,9 @@ trader/
    - 夜間先物・ADR（米国上場の日本企業株）との連動指標
 
 2. **モデルアーキテクチャ**
-   - TFT の本格評価（学習時間確保が必要）
-   - アンサンブル（LightGBM + TFT の予測を組み合わせる）
-   - iTransformer（多変量時系列に特化した 2024 年提案モデル）
+   - ~~TFT の本格評価~~ → 評価済み。LightGBM と同等以下のため不採用。
+   - ~~アンサンブル（LightGBM + TFT）~~ → TFT 不採用のため見送り。
+   - iTransformer（多変量時系列に特化した 2024 年提案モデル）は今後の候補として残す
 
 3. **損失関数・ターゲット設計**
    - 方向的中率を直接最適化する損失関数（quantile loss など）

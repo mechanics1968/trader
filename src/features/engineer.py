@@ -20,11 +20,20 @@ import config
 logger = logging.getLogger(__name__)
 
 
+def _rolling_ts_rank(series: pd.Series, window: int) -> pd.Series:
+    """時系列ランク: 直近 window 日中の現在値の百分位（0〜1）を返す。"""
+    return series.rolling(window, min_periods=window // 2).apply(
+        lambda x: float((x[:-1] <= x[-1]).mean()), raw=True
+    )
+
+
 def build_features(
     ticker: str,
     df: pd.DataFrame,
     sector_returns: pd.DataFrame | None = None,
     market_returns: pd.DataFrame | None = None,
+    earnings_dates: pd.Series | None = None,
+    foreign_flow: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     1銘柄分の OHLCV から特徴量を生成して保存する。
@@ -35,6 +44,10 @@ def build_features(
         銘柄ティッカー（例: "7203.T"）
     df : pd.DataFrame
         列: open, high, low, close, volume / index: date
+    earnings_dates : pd.Series | None
+        この銘柄の決算発表日リスト（pd.Series of datetime）
+    foreign_flow : pd.DataFrame | None
+        align_foreign_flow_to_daily() の出力（日次外資売買動向）
 
     Returns
     -------
@@ -159,7 +172,7 @@ def build_features(
         df["alpha_1d"] = df["return_1d"] - df["beta_20d"] * mkt_1d
 
     # ------------------------------------------------------------------ #
-    # 追加特徴量
+    # 追加特徴量（既存）
     # ------------------------------------------------------------------ #
     # 当日の日中変動（始値→終値）
     df["intraday_return"] = (close - df["open"]) / (df["open"] + 1e-9)
@@ -172,6 +185,95 @@ def build_features(
     # 累積高値・安値からの距離（データ期間内の相対位置）
     df["dist_running_high"] = (high.expanding().max() - close) / (close + 1e-9)
     df["dist_running_low"] = (close - low.expanding().min()) / (close + 1e-9)
+
+    # ------------------------------------------------------------------ #
+    # 追加特徴量（新規: 世界標準シグナル）
+    # ------------------------------------------------------------------ #
+
+    # --- 中期モメンタム（Gu et al. 2020 第2・第5位因子） ---
+    df["return_20d"] = close.pct_change(20)
+    df["return_60d"] = close.pct_change(60)
+
+    # --- Amihud 非流動性（同論文 第3位因子） ---
+    # |日次リターン| / 売買代金。非流動性が高いほど次日リバウンドしやすい
+    dollar_vol = volume * close
+    df["amihud"] = df["return_1d"].abs() / (dollar_vol + 1.0)
+    df["amihud_20"] = df["amihud"].rolling(20).mean()
+
+    # --- WorldQuant Alpha#101: intraday body ratio ---
+    # (close - open) / (high - low)。日中方向の強さを高値安値レンジで正規化
+    df["body_ratio"] = (close - df["open"]) / (high - low + 1e-6)
+
+    # --- WorldQuant Alpha#12: 出来高-価格乖離シグナル ---
+    # 出来高が増えたのに価格が下がった(or逆)場合は次日に反転しやすい
+    df["vol_price_div"] = np.sign(volume.diff(1)) * (-close.diff(1) / (close + 1e-9))
+
+    # --- MAX effect（過去20日の最大・最小日次リターン） ---
+    # 直近で大きく上がった銘柄は翌日反転しやすい（宝くじ効果）
+    df["max_ret_20d"] = df["return_1d"].rolling(20).max()
+    df["min_ret_20d"] = df["return_1d"].rolling(20).min()
+
+    # --- 52週高値・安値からの距離（ローリング252日） ---
+    # 高値圏にある銘柄はモメンタム継続、安値圏は反転候補
+    df["high_52w_ratio"] = close / (high.rolling(252, min_periods=60).max() + 1e-9) - 1
+    df["low_52w_ratio"] = close / (low.rolling(252, min_periods=60).min() + 1e-9) - 1
+
+    # --- MACD ヒストグラム変化量（モメンタムの加速度） ---
+    df["macd_hist_change"] = df["macd_hist"].diff(1)
+
+    # --- ボラティリティレジーム（短期/長期ボラの比率） ---
+    # >1 なら最近ボラが高まっている（ブレイクアウトまたは混乱局面）
+    df["vol_regime"] = df["std_5"] / (df["std_20"] + 1e-9)
+
+    # --- Overnight gap の持続性（直近5日の平均ギャップ） ---
+    df["gap_ratio_5d_mean"] = df["gap_ratio"].rolling(5).mean()
+
+    # --- Alpha#4: 時系列ランク（安値の9日内順位の逆符号） ---
+    # 安値が相対的に低い（最近売られている）→ 反転期待
+    df["ts_rank_low_9"] = -_rolling_ts_rank(low, 9)
+
+    # --- Alpha#6: 始値と出来高の10日相関（逆符号） ---
+    # 始値が高いときに出来高が多い = 分布売り → 次日下落シグナル
+    df["open_vol_corr_10"] = -df["open"].rolling(10).corr(volume)
+
+    # ------------------------------------------------------------------ #
+    # 決算接近フラグ（earnings_dates が渡された場合のみ）
+    # ------------------------------------------------------------------ #
+    if earnings_dates is not None and len(earnings_dates) > 0:
+        ann_dates = pd.to_datetime(earnings_dates.values)
+        idx_dates = df.index.normalize() if hasattr(df.index, "normalize") else pd.to_datetime(df.index)
+
+        def _nearest_earnings_days(d: pd.Timestamp) -> float:
+            """d から最も近い決算日までの日数（正=未来、負=過去）。"""
+            diffs = (ann_dates - d).days if hasattr(ann_dates[0], "days") else (ann_dates - d) / np.timedelta64(1, "D")
+            # numpy timedelta
+            diffs = np.array([(a - d).days for a in ann_dates], dtype=float)
+            if len(diffs) == 0:
+                return np.nan
+            abs_min_idx = np.argmin(np.abs(diffs))
+            return float(diffs[abs_min_idx])
+
+        days_arr = np.array([_nearest_earnings_days(d) for d in idx_dates], dtype=float)
+        df["days_to_earnings"] = days_arr
+        # 決算前後 5 営業日以内のフラグ（モデルへの入力 + 推薦フィルタに使用）
+        df["near_earnings_flag"] = (np.abs(days_arr) <= 5).astype(float)
+    else:
+        # 決算情報なし: 999 = 「決算から非常に遠い」という番兵値（dropna で落とさないため NaN は使わない）
+        df["days_to_earnings"] = 999.0
+        df["near_earnings_flag"] = 0.0
+
+    # ------------------------------------------------------------------ #
+    # 外資売買動向（foreign_flow が渡された場合のみ）
+    # ------------------------------------------------------------------ #
+    if foreign_flow is not None and not foreign_flow.empty:
+        for col in ["foreign_net_buy", "foreign_net_buy_4wk", "foreign_buy_regime"]:
+            if col in foreign_flow.columns:
+                df[col] = foreign_flow[col].reindex(df.index)
+        # 欠損を中立値（0.5）で補完
+        df["foreign_buy_regime"] = df["foreign_buy_regime"].fillna(0.5)
+    else:
+        # 外資データなし: 0.5 = 中立（買い越しでも売り越しでもない）
+        df["foreign_buy_regime"] = 0.5
 
     # ------------------------------------------------------------------ #
     # ターゲット変数
@@ -205,6 +307,8 @@ def build_features(
 def build_features_all(
     price_data: dict[str, pd.DataFrame],
     ticker_info: pd.DataFrame | None = None,
+    earnings_calendar: "pd.DataFrame | None" = None,
+    foreign_flow: "pd.DataFrame | None" = None,
 ) -> dict[str, pd.DataFrame]:
     """
     全銘柄の特徴量を一括生成する。
@@ -215,12 +319,18 @@ def build_features_all(
         {ticker: OHLCV DataFrame}
     ticker_info : pd.DataFrame | None
         fetch_tickers() の出力。sector17 列を持つ場合、セクター相対リターンを追加する。
+    earnings_calendar : pd.DataFrame | None
+        fetch_earnings_calendar() の出力（列: ticker, announcement_date）
+    foreign_flow : pd.DataFrame | None
+        fetch_foreign_flow() の出力（週次外資売買動向）
 
     Returns
     -------
     dict[str, pd.DataFrame]
         {ticker: 特徴量 DataFrame}
     """
+    from src.fetch.foreign_flow import align_foreign_flow_to_daily
+
     # 市場平均リターンを事前計算（全銘柄共通）
     market_returns = _compute_market_returns(price_data)
     logger.info("市場平均リターンを計算しました")
@@ -231,17 +341,39 @@ def build_features_all(
         sector_return_map = _compute_sector_returns(price_data, ticker_info)
         logger.info("セクター相対リターンを計算しました（%d 銘柄）", len(sector_return_map))
 
+    # 外資売買動向: 代表的な日次インデックスに合わせて展開（最初の銘柄を使用）
+    foreign_flow_daily: pd.DataFrame | None = None
+    if foreign_flow is not None and not foreign_flow.empty:
+        sample_dates = next(iter(price_data.values())).index
+        foreign_flow_daily = align_foreign_flow_to_daily(foreign_flow, pd.DatetimeIndex(sample_dates))
+        logger.info("外資売買動向を日次展開しました")
+
+    # 決算カレンダーを ticker ごとに整理
+    earnings_map: dict[str, pd.Series] = {}
+    if earnings_calendar is not None and not earnings_calendar.empty:
+        ec = earnings_calendar.copy()
+        ec["announcement_date"] = pd.to_datetime(ec["announcement_date"])
+        for ticker, grp in ec.groupby("ticker"):
+            earnings_map[ticker] = grp["announcement_date"].reset_index(drop=True)
+        logger.info("決算カレンダー: %d 銘柄分", len(earnings_map))
+
     features: dict[str, pd.DataFrame] = {}
     for ticker, df in price_data.items():
         try:
             sec_ret = sector_return_map.get(ticker)
+            ed = earnings_map.get(ticker)
             features[ticker] = build_features(
                 ticker, df,
                 sector_returns=sec_ret,
                 market_returns=market_returns,
+                earnings_dates=ed,
+                foreign_flow=foreign_flow_daily,
             )
         except Exception as exc:
             logger.warning("%s: 特徴量生成失敗: %s", ticker, exc)
+
+    # クロスセクションランク特徴量を追加（全銘柄処理後に実施）
+    features = _add_cross_sectional_ranks(features)
     logger.info("特徴量生成完了: %d 銘柄", len(features))
     return features
 
@@ -259,6 +391,42 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
         c for c in df.columns
         if c not in exclude and pd.api.types.is_numeric_dtype(df[c])
     ]
+
+
+def _add_cross_sectional_ranks(features: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """
+    全銘柄処理後にクロスセクションランク特徴量を追加する。
+
+    各日付について全銘柄の特徴量を百分位ランク化する（0=最低、1=最高）。
+    LightGBM のクロスセクション予測において、銘柄間のスケール差を吸収しながら
+    相対的な強弱シグナルを表現する最も有効な方法の1つ（Gu et al. 2020）。
+    """
+    # ランク化対象列: (元の列名, 新しい列名)
+    rank_targets = [
+        ("return_1d",       "cs_rank_ret1d"),   # 短期リターン（逆張りシグナル）
+        ("return_5d",       "cs_rank_ret5d"),   # 5日リターン（短期モメンタム）
+        ("return_20d",      "cs_rank_ret20d"),  # 20日リターン（中期モメンタム）
+        ("amihud_20",       "cs_rank_amihud"),  # 非流動性（Amihud）
+        ("volume_ratio_20", "cs_rank_vol20"),   # 出来高異常度
+        ("vol_regime",      "cs_rank_volreg"),  # ボラティリティレジーム
+    ]
+
+    for src_col, dst_col in rank_targets:
+        # 日付×銘柄のワイドフォーマットに変換
+        wide = pd.DataFrame(
+            {ticker: df[src_col] for ticker, df in features.items() if src_col in df.columns}
+        )
+        if wide.empty:
+            continue
+
+        # 各日付のクロスセクションで百分位ランク（NaN は無視）
+        cs_rank = wide.rank(axis=1, pct=True, na_option="keep")
+
+        for ticker in features:
+            if ticker in cs_rank.columns:
+                features[ticker][dst_col] = cs_rank[ticker].reindex(features[ticker].index)
+
+    return features
 
 
 def _save(ticker: str, df: pd.DataFrame) -> None:

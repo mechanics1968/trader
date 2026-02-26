@@ -23,6 +23,8 @@ import config
 from src.fetch.tickers import fetch_tickers, get_ticker_list
 from src.fetch.prices import fetch_prices
 from src.fetch.lot_size import fetch_lot_sizes
+from src.fetch.earnings import fetch_earnings_calendar
+from src.fetch.foreign_flow import fetch_foreign_flow
 from src.features.engineer import build_features_all
 from src.models.train import train
 from src.models.predict import predict_next_day
@@ -33,18 +35,23 @@ from src.models.tft_predict import predict_next_day_tft
 from src.strategy.recommend import build_recommendations
 from src.report.output import save_recommendations, print_recommendations
 
-logging.basicConfig(
-    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(
-            config.RESULTS_DIR / f"{date.today()}.log",
-            encoding="utf-8",
-        ),
-    ],
-)
+def _setup_logging() -> logging.Logger:
+    """ロギングを設定して logger を返す。DDP ワーカーでの多重設定を避けるため関数化。"""
+    logging.basicConfig(
+        level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(
+                config.RESULTS_DIR / f"{date.today()}.log",
+                encoding="utf-8",
+            ),
+        ],
+    )
+    return logging.getLogger(__name__)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -108,10 +115,23 @@ def main() -> None:
     logger.info("取得成功: %d 銘柄", len(price_data))
 
     # ------------------------------------------------------------------ #
+    # Step 2b: 外部データ取得（決算カレンダー・外資売買動向）
+    # ------------------------------------------------------------------ #
+    logger.info("[Step 2b] 決算カレンダーを取得します")
+    earnings_calendar = fetch_earnings_calendar(tickers, refresh=args.refresh)
+
+    logger.info("[Step 2b] 外資売買動向を取得します")
+    foreign_flow = fetch_foreign_flow(refresh=args.refresh)
+
+    # ------------------------------------------------------------------ #
     # Step 3: 特徴量エンジニアリング
     # ------------------------------------------------------------------ #
     logger.info("[Step 3] 特徴量を生成します")
-    features = build_features_all(price_data, ticker_info)
+    features = build_features_all(
+        price_data, ticker_info,
+        earnings_calendar=earnings_calendar,
+        foreign_flow=foreign_flow,
+    )
 
     # ------------------------------------------------------------------ #
     # Step 4a: 多目的ハイパーパラメータ最適化（lgbm 専用）
@@ -200,4 +220,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # DDP では torch.multiprocessing.spawn がこのスクリプトを再 import するため、
+    # ロギング設定と main() の呼び出しをこのガードの内側に限定する。
+    logger = _setup_logging()
     main()

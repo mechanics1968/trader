@@ -173,11 +173,13 @@ def _run_tft_predict(
         num_workers=0,
     )
 
+    import torch as _torch
+    _acc = "gpu" if _torch.cuda.is_available() else "cpu"
     predictions = wrapper.model.predict(
         pred_dl,
         mode="prediction",
         return_index=True,
-        trainer_kwargs={"accelerator": "cpu"},
+        trainer_kwargs={"accelerator": _acc, "devices": 1},
     )
 
     # predictions.index は DataFrame（ticker 列を含む）

@@ -32,6 +32,27 @@ def _detect_accelerator() -> str:
     return "cpu"
 
 
+def _get_ddp_config() -> tuple[str, int | str, str | None]:
+    """
+    (accelerator, devices, strategy) を返す。
+
+    - CUDA が複数枚あれば ddp_spawn で全 GPU 使用
+      ※ "ddp" は script を再起動するため main.py 全体が N 回実行されてしまう。
+         "ddp_spawn" は trainer.fit() 内で torch.multiprocessing.spawn を呼ぶため
+         main.py は 1 回しか実行されず、spawn された子プロセスは訓練ループのみ担当する。
+    - CUDA 1 枚なら single GPU
+    - MPS / CPU はシングルプロセス
+    """
+    if torch.cuda.is_available():
+        n_gpu = torch.cuda.device_count()
+        if n_gpu > 1:
+            return "gpu", n_gpu, "ddp_spawn"
+        return "gpu", 1, None
+    if torch.backends.mps.is_available():
+        return "mps", 1, None
+    return "cpu", "auto", None
+
+
 def train_tft(
     features: dict,
     target_col: str,
@@ -125,22 +146,42 @@ def train_tft(
         training_dataset=training_dataset,
     )
 
-    # DataLoader（MPS/fork 相性問題のため num_workers=0）
+    # DDP 設定を決定
+    accelerator, devices, strategy = _get_ddp_config()
+    n_devices = devices if isinstance(devices, int) else 1
+    logger.info("アクセラレータ: %s / devices: %s / strategy: %s", accelerator, devices, strategy)
+
+    # ddp_spawn / MPS は fork との相性問題があるため num_workers=0 固定。
+    # それ以外（single GPU / CPU）は設定値を使用。
+    num_workers = 0 if (accelerator == "mps" or strategy == "ddp_spawn") else config.TFT_NUM_WORKERS
+
+    # DataLoader
     train_dl = training_dataset.to_dataloader(
         train=True,
         batch_size=config.TFT_BATCH_SIZE,
-        num_workers=0,
+        num_workers=num_workers,
+        persistent_workers=(num_workers > 0),
     )
     val_dl = val_dataset.to_dataloader(
         train=False,
         batch_size=config.TFT_BATCH_SIZE,
-        num_workers=0,
+        num_workers=num_workers,
+        persistent_workers=(num_workers > 0),
     )
+
+    # 学習率: GPU 数に比例してスケールアップ（Linear Scaling Rule）
+    effective_lr = config.TFT_LEARNING_RATE
+    if config.TFT_LR_SCALE_WITH_GPUS and n_devices > 1:
+        effective_lr = config.TFT_LEARNING_RATE * n_devices
+        logger.info(
+            "LR スケーリング: %.2e × %d GPU = %.2e",
+            config.TFT_LEARNING_RATE, n_devices, effective_lr,
+        )
 
     # モデル構築
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
-        learning_rate=config.TFT_LEARNING_RATE,
+        learning_rate=effective_lr,
         hidden_size=config.TFT_HIDDEN_SIZE,
         attention_head_size=config.TFT_ATTENTION_HEADS,
         dropout=config.TFT_DROPOUT,
@@ -168,29 +209,30 @@ def train_tft(
         mode="min",
     )
 
-    # Trainer
-    accelerator = _detect_accelerator()
-    logger.info("アクセラレータ: %s", accelerator)
-
     csv_logger = CSVLogger(
         save_dir=str(save_dir),
         name="logs",
         version=0,
     )
 
-    trainer = pl.Trainer(
+    trainer_kwargs: dict = dict(
         accelerator=accelerator,
+        devices=devices,
         max_epochs=config.TFT_MAX_EPOCHS,
         gradient_clip_val=config.TFT_GRADIENT_CLIP,
         callbacks=[ckpt_callback, early_stopping],
         enable_progress_bar=True,
         logger=csv_logger,
     )
+    if strategy is not None:
+        trainer_kwargs["strategy"] = strategy
 
+    trainer = pl.Trainer(**trainer_kwargs)
     trainer.fit(tft, train_dl, val_dl)
 
     # ベストモデル読み込み
-    best_ckpt = ckpt_callback.best_model_path
+    # ddp_spawn では best_model_path が空になる場合があるため canonical パスにフォールバックする
+    best_ckpt = ckpt_callback.best_model_path or str(save_dir / "best_model.ckpt")
     logger.info("ベストチェックポイント: %s", best_ckpt)
     best_model = TemporalFusionTransformer.load_from_checkpoint(best_ckpt)
     best_model.eval()

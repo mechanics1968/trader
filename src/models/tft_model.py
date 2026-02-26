@@ -360,14 +360,16 @@ class TFTModelWrapper:
             num_workers=0,
         )
 
+        import torch as _torch
+        _acc = "gpu" if _torch.cuda.is_available() else "cpu"
         predictions = self.model.predict(
             val_dl,
             return_y=True,
             mode="prediction",
-            trainer_kwargs={"accelerator": "cpu"},
+            trainer_kwargs={"accelerator": _acc, "devices": 1},
         )
 
-        y_pred = predictions.output.squeeze(-1).numpy()
-        y_actual = predictions.y[0].squeeze(-1).numpy()
+        y_pred = predictions.output.squeeze(-1).cpu().numpy()
+        y_actual = predictions.y[0].squeeze(-1).cpu().numpy()
 
         return y_pred, y_actual
