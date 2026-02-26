@@ -17,7 +17,9 @@
       "Bash(pkill:*)",
       "WebFetch(domain:jpx-jquants.com)",
       "Bash(ps:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(source:*)",
+      "Bash(# メインプロセスと子プロセスを全停止 pkill -f \"\"main.py\"\" sleep 2 ps aux)"
     ]
   }
 }

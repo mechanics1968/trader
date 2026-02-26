@@ -181,11 +181,18 @@ def _worker(
     """
     import optuna as _optuna
     _optuna.logging.set_verbosity(_optuna.logging.WARNING)
-    _study = _optuna.load_study(study_name=study_name, storage=storage)
+    _study = _optuna.create_study(
+        study_name=study_name,
+        storage=storage,
+        load_if_exists=True,
+        directions=["minimize", "minimize", "minimize", "minimize", "minimize"],
+        sampler=_optuna.samplers.NSGAIISampler(seed=42),
+    )
     _study.optimize(
         lambda trial: _objective(trial, opt_features, lgbm_n_jobs=lgbm_n_jobs),
         n_trials=n_trials,
         n_jobs=1,
+        catch=(Exception,),  # 子プロセス内の例外を FAIL 状態にして継続
     )
 
 
@@ -254,7 +261,9 @@ def run_optimization(
 
     # n_jobs > 1 の場合はストレージが必須（NSGAIISampler の並列安全性のため）
     if n_jobs > 1 and storage is None:
-        storage = f"sqlite:///{config.BASE_DIR / 'optuna.db'}"
+        # spawn プロセスでも確実に書き込める /tmp を使用
+        db_path = "/tmp/trader_optuna.db"
+        storage = f"sqlite:///{db_path}"
         logger.warning(
             "n_jobs > 1 には永続ストレージが必要です。自動的に SQLite を使用します: %s", storage
         )

@@ -23,8 +23,8 @@ import config
 from src.fetch.tickers import fetch_tickers, get_ticker_list
 from src.fetch.prices import fetch_prices
 from src.fetch.lot_size import fetch_lot_sizes
-from src.fetch.earnings import fetch_earnings_calendar
 from src.fetch.foreign_flow import fetch_foreign_flow
+from src.fetch.us_market import fetch_us_market
 from src.features.engineer import build_features_all
 from src.models.train import train
 from src.models.predict import predict_next_day
@@ -115,13 +115,18 @@ def main() -> None:
     logger.info("取得成功: %d 銘柄", len(price_data))
 
     # ------------------------------------------------------------------ #
-    # Step 2b: 外部データ取得（決算カレンダー・外資売買動向）
+    # Step 2b: 外部データ取得（外資売買動向・米国市場）
     # ------------------------------------------------------------------ #
-    logger.info("[Step 2b] 決算カレンダーを取得します")
-    earnings_calendar = fetch_earnings_calendar(tickers, refresh=args.refresh)
-
     logger.info("[Step 2b] 外資売買動向を取得します")
     foreign_flow = fetch_foreign_flow(refresh=args.refresh)
+
+    logger.info("[Step 2b] 米国市場データを取得します")
+    try:
+        us_market = fetch_us_market(refresh=args.refresh)
+        logger.info("米国市場データ取得完了: %d 行 / 特徴量: %s", len(us_market), us_market.columns.tolist())
+    except Exception as exc:
+        logger.warning("米国市場データ取得失敗: %s", exc)
+        us_market = None
 
     # ------------------------------------------------------------------ #
     # Step 3: 特徴量エンジニアリング
@@ -129,8 +134,8 @@ def main() -> None:
     logger.info("[Step 3] 特徴量を生成します")
     features = build_features_all(
         price_data, ticker_info,
-        earnings_calendar=earnings_calendar,
         foreign_flow=foreign_flow,
+        us_market=us_market,
     )
 
     # ------------------------------------------------------------------ #

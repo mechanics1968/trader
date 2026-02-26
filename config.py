@@ -100,7 +100,8 @@ MARKET_DECLINE_THRESHOLD: float = -1.0
 # クロスセクション標準化ターゲット
 # True: 日付ごとに全銘柄の alpha を z-score 標準化した target_cs_* を学習ターゲットとして使用
 # False: target_alpha_* （残差リターン）をそのまま使用
-USE_CS_TARGET: bool = False  # CS z-score は絶対勝率を改善しないため無効化（実験済み）
+USE_CS_TARGET: bool = False      # CS z-score は絶対勝率を改善しないため無効化（実験済み）
+USE_INTRADAY_TARGET: bool = True  # 終値モデルのターゲットを日中騰落率（始値→終値）に変更
 
 # ---------------------------------------------------------------------------
 # モデル（TFT: Temporal Fusion Transformer）

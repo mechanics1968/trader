@@ -59,7 +59,13 @@ def evaluate_predictions(
 
         valid_idx = X_val.index
         y_actual_open = val_df.loc[valid_idx, "target_open_return"].values
-        y_actual_close = val_df.loc[valid_idx, "target_close_return"].values
+        # 終値モデルのターゲットは日中騰落率（USE_INTRADAY_TARGET=True）
+        close_target_col = (
+            "target_intraday_return"
+            if config.USE_INTRADAY_TARGET and "target_intraday_return" in val_df.columns
+            else "target_close_return"
+        )
+        y_actual_close = val_df.loc[valid_idx, close_target_col].values
 
         y_pred_open = model_open.predict(X_val)
         y_pred_close = model_close.predict(X_val)
@@ -69,11 +75,12 @@ def evaluate_predictions(
         all_actual_close.extend(y_actual_close)
         all_pred_close.extend(y_pred_close)
 
+    close_label = "日中騰落率" if config.USE_INTRADAY_TARGET else "終値"
     metrics = {
         "始値_方向的中率": _directional_accuracy(all_actual_open, all_pred_open),
-        "終値_方向的中率": _directional_accuracy(all_actual_close, all_pred_close),
+        f"{close_label}_方向的中率": _directional_accuracy(all_actual_close, all_pred_close),
         "始値_RMSE": _rmse(all_actual_open, all_pred_open),
-        "終値_RMSE": _rmse(all_actual_close, all_pred_close),
+        f"{close_label}_RMSE": _rmse(all_actual_close, all_pred_close),
     }
 
     # デイトレ収益シミュレーション（終値 - 始値）
@@ -146,16 +153,30 @@ def _simulate_strategy(
 ) -> np.ndarray:
     """
     予測で「上昇」と判定した銘柄のみ投資した場合のリターン列を返す。
-    （始値で買い → 終値で売り）
+
+    USE_INTRADAY_TARGET=True の場合:
+      pred_close / actual_close は日中騰落率（変化率）。
+      投資判定: pred_close > 0（日中上昇予測）
+      実績リターン: actual_close（日中騰落率そのまま）
+
+    USE_INTRADAY_TARGET=False の場合:
+      pred_open / pred_close は始値・終値の変化率。
+      投資判定: pred_close > pred_open
+      実績リターン: actual_close - actual_open
     """
     p_open = np.array(pred_open)
     p_close = np.array(pred_close)
     a_open = np.array(actual_open)
     a_close = np.array(actual_close)
 
-    # 予測で終値 > 始値 のとき投資
-    invest_mask = p_close > p_open
-    actual_gain = np.where(invest_mask, a_close - a_open, 0.0)
+    if config.USE_INTRADAY_TARGET:
+        # pred_close は日中騰落率（変化率）。正なら上昇予測
+        invest_mask = p_close > 0
+        actual_gain = np.where(invest_mask, a_close, 0.0)
+    else:
+        # 予測で終値 > 始値 のとき投資
+        invest_mask = p_close > p_open
+        actual_gain = np.where(invest_mask, a_close - a_open, 0.0)
     return actual_gain
 
 

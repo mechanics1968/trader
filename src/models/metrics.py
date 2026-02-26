@@ -120,7 +120,12 @@ def compute_errors(
 
         valid_idx = X_val.index
         y_actual_open = val_df.loc[valid_idx, "target_open_return"].to_numpy()
-        y_actual_close = val_df.loc[valid_idx, "target_close_return"].to_numpy()
+        close_col = (
+            "target_intraday_return"
+            if config.USE_INTRADAY_TARGET and "target_intraday_return" in val_df.columns
+            else "target_close_return"
+        )
+        y_actual_close = val_df.loc[valid_idx, close_col].to_numpy()
 
         y_pred_open = model_open.predict(X_val)
         y_pred_close = model_close.predict(X_val)

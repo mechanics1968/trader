@@ -65,28 +65,29 @@ def train(
     feat_cols = get_feature_columns(combined)
     X = combined[feat_cols]
 
-    # ターゲット変数の選択: CS z-score > 残差α > 絶対リターン の優先順位
-    if "target_cs_open" in combined.columns and "target_cs_close" in combined.columns:
-        y_open  = combined["target_cs_open"]
-        y_close = combined["target_cs_close"]
-        label_open  = "始値(CS-z)"
-        label_close = "終値(CS-z)"
-        target_cols = ["target_cs_open", "target_cs_close"]
-        logger.info("クロスセクション標準化ターゲット（z-スコア）を使用します")
-    elif "target_alpha_open" in combined.columns and "target_alpha_close" in combined.columns:
-        y_open  = combined["target_alpha_open"]
-        y_close = combined["target_alpha_close"]
-        label_open  = "始値(超過α)"
-        label_close = "終値(超過α)"
-        target_cols = ["target_alpha_open", "target_alpha_close"]
+    # ターゲット変数の選択:
+    #   始値モデル: 残差α（市場ベータ除去） > 絶対リターン
+    #   終値モデル: 日中騰落率（target_intraday_return）を直接予測
+    #              → デイトレの実損益に直結し、始値予測の誤差が伝播しない
+    if "target_alpha_open" in combined.columns:
+        y_open     = combined["target_alpha_open"]
+        label_open = "始値(超過α)"
         logger.info("残差ターゲット（超過リターン）を使用します")
     else:
-        y_open  = combined["target_open_return"]
-        y_close = combined["target_close_return"]
-        label_open  = "始値"
-        label_close = "終値"
-        target_cols = ["target_open_return", "target_close_return"]
+        y_open     = combined["target_open_return"]
+        label_open = "始値"
         logger.warning("残差ターゲット列が見つかりません。通常ターゲットにフォールバックします")
+
+    if "target_intraday_return" in combined.columns:
+        y_close     = combined["target_intraday_return"]
+        label_close = "日中騰落率"
+        logger.info("日中騰落率を終値モデルのターゲットとして使用します")
+    elif "target_alpha_close" in combined.columns:
+        y_close     = combined["target_alpha_close"]
+        label_close = "終値(超過α)"
+    else:
+        y_close     = combined["target_close_return"]
+        label_close = "終値"
 
     date_col = combined["date"] if "date" in combined.columns else None
     model_open = _train_single(X, y_open, label=label_open, params=params,
@@ -156,11 +157,12 @@ def _train_single(
         callbacks=callbacks,
     )
 
+    rmse_val = model.best_score.get("valid_0", {}).get("rmse", float("nan"))
     logger.info(
         "[%s] 最適ラウンド数: %d / RMSE(val): %.6f",
         label,
         model.best_iteration,
-        model.best_score["valid_0"]["rmse"],
+        rmse_val,
     )
     return model
 

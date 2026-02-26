@@ -69,14 +69,20 @@ def predict_next_day(
         score_close = float(model_close.predict(X)[0])
 
         if config.USE_CS_TARGET:
-            # CS モード: モデル出力は z-score。価格予測は last_close をそのまま使う
-            # （z-score を return として解釈すると pred_open/pred_close が乖離するため）
+            # CS モード: モデル出力は z-score
             pred_open  = last_close
             pred_close = last_close
-            # 推薦スコア: 終値 z-score × 100（大きいほど全銘柄の中で高い終値を予測）
+            expected_gain_pct = score_close * 100
+        elif config.USE_INTRADAY_TARGET:
+            # 日中騰落率モード:
+            #   score_open  = 翌日始値の超過リターン予測（前日終値比）
+            #   score_close = 翌日日中騰落率予測（始値→終値）
+            pred_open  = last_close * (1 + score_open)
+            pred_close = pred_open  * (1 + score_close)
+            # 期待利益 = 日中騰落率そのもの
             expected_gain_pct = score_close * 100
         else:
-            # Alpha / 絶対リターンモード: return として解釈して絶対価格を計算
+            # Alpha / 絶対リターンモード
             pred_open  = last_close * (1 + score_open)
             pred_close = last_close * (1 + score_close)
             expected_gain_pct = (score_close - score_open) * 100

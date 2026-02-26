@@ -32,8 +32,8 @@ def build_features(
     df: pd.DataFrame,
     sector_returns: pd.DataFrame | None = None,
     market_returns: pd.DataFrame | None = None,
-    earnings_dates: pd.Series | None = None,
     foreign_flow: pd.DataFrame | None = None,
+    us_market: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     1銘柄分の OHLCV から特徴量を生成して保存する。
@@ -44,8 +44,6 @@ def build_features(
         銘柄ティッカー（例: "7203.T"）
     df : pd.DataFrame
         列: open, high, low, close, volume / index: date
-    earnings_dates : pd.Series | None
-        この銘柄の決算発表日リスト（pd.Series of datetime）
     foreign_flow : pd.DataFrame | None
         align_foreign_flow_to_daily() の出力（日次外資売買動向）
 
@@ -228,40 +226,11 @@ def build_features(
     # --- Overnight gap の持続性（直近5日の平均ギャップ） ---
     df["gap_ratio_5d_mean"] = df["gap_ratio"].rolling(5).mean()
 
-    # --- Alpha#4: 時系列ランク（安値の9日内順位の逆符号） ---
-    # 安値が相対的に低い（最近売られている）→ 反転期待
-    df["ts_rank_low_9"] = -_rolling_ts_rank(low, 9)
-
     # --- Alpha#6: 始値と出来高の10日相関（逆符号） ---
     # 始値が高いときに出来高が多い = 分布売り → 次日下落シグナル
     df["open_vol_corr_10"] = -df["open"].rolling(10).corr(volume)
 
     # ------------------------------------------------------------------ #
-    # 決算接近フラグ（earnings_dates が渡された場合のみ）
-    # ------------------------------------------------------------------ #
-    if earnings_dates is not None and len(earnings_dates) > 0:
-        ann_dates = pd.to_datetime(earnings_dates.values)
-        idx_dates = df.index.normalize() if hasattr(df.index, "normalize") else pd.to_datetime(df.index)
-
-        def _nearest_earnings_days(d: pd.Timestamp) -> float:
-            """d から最も近い決算日までの日数（正=未来、負=過去）。"""
-            diffs = (ann_dates - d).days if hasattr(ann_dates[0], "days") else (ann_dates - d) / np.timedelta64(1, "D")
-            # numpy timedelta
-            diffs = np.array([(a - d).days for a in ann_dates], dtype=float)
-            if len(diffs) == 0:
-                return np.nan
-            abs_min_idx = np.argmin(np.abs(diffs))
-            return float(diffs[abs_min_idx])
-
-        days_arr = np.array([_nearest_earnings_days(d) for d in idx_dates], dtype=float)
-        df["days_to_earnings"] = days_arr
-        # 決算前後 5 営業日以内のフラグ（モデルへの入力 + 推薦フィルタに使用）
-        df["near_earnings_flag"] = (np.abs(days_arr) <= 5).astype(float)
-    else:
-        # 決算情報なし: 999 = 「決算から非常に遠い」という番兵値（dropna で落とさないため NaN は使わない）
-        df["days_to_earnings"] = 999.0
-        df["near_earnings_flag"] = 0.0
-
     # ------------------------------------------------------------------ #
     # 外資売買動向（foreign_flow が渡された場合のみ）
     # ------------------------------------------------------------------ #
@@ -276,13 +245,26 @@ def build_features(
         df["foreign_buy_regime"] = 0.5
 
     # ------------------------------------------------------------------ #
+    # 米国市場特徴量（us_market が渡された場合のみ）
+    # 日本株の翌営業日始値は前日の米国市場動向に強く連動する
+    # ------------------------------------------------------------------ #
+    if us_market is not None and not us_market.empty:
+        # 日付インデックスを正規化して結合
+        us_idx = us_market.copy()
+        us_idx.index = pd.to_datetime(us_idx.index).normalize()
+        df_idx = pd.to_datetime(df.index).normalize()
+        for col in us_idx.columns:
+            df[col] = us_idx[col].reindex(df_idx).values
+        logger.debug("米国市場特徴量を追加: %s", us_idx.columns.tolist())
+
+    # ------------------------------------------------------------------ #
     # ターゲット変数
     # ------------------------------------------------------------------ #
     # 翌日の始値変化率（前日終値比）
     df["target_open_return"] = df["open"].shift(-1) / close - 1
-    # 翌日の終値変化率（前日終値比）— TFT 互換のため保持
+    # 翌日の終値変化率（前日終値比）
     df["target_close_return"] = close.shift(-1) / close - 1
-    # 翌日の日中変動（始値→終値）— LightGBM の終値モデル用
+    # 翌日の日中騰落率（始値→終値）— デイトレの実損益に直結する予測ターゲット
     df["target_intraday_return"] = close.shift(-1) / df["open"].shift(-1) - 1
 
     # 残差ターゲット変数（市場ベータを除去した超過リターン）
@@ -307,8 +289,8 @@ def build_features(
 def build_features_all(
     price_data: dict[str, pd.DataFrame],
     ticker_info: pd.DataFrame | None = None,
-    earnings_calendar: "pd.DataFrame | None" = None,
     foreign_flow: "pd.DataFrame | None" = None,
+    us_market: "pd.DataFrame | None" = None,
 ) -> dict[str, pd.DataFrame]:
     """
     全銘柄の特徴量を一括生成する。
@@ -319,8 +301,6 @@ def build_features_all(
         {ticker: OHLCV DataFrame}
     ticker_info : pd.DataFrame | None
         fetch_tickers() の出力。sector17 列を持つ場合、セクター相対リターンを追加する。
-    earnings_calendar : pd.DataFrame | None
-        fetch_earnings_calendar() の出力（列: ticker, announcement_date）
     foreign_flow : pd.DataFrame | None
         fetch_foreign_flow() の出力（週次外資売買動向）
 
@@ -348,26 +328,16 @@ def build_features_all(
         foreign_flow_daily = align_foreign_flow_to_daily(foreign_flow, pd.DatetimeIndex(sample_dates))
         logger.info("外資売買動向を日次展開しました")
 
-    # 決算カレンダーを ticker ごとに整理
-    earnings_map: dict[str, pd.Series] = {}
-    if earnings_calendar is not None and not earnings_calendar.empty:
-        ec = earnings_calendar.copy()
-        ec["announcement_date"] = pd.to_datetime(ec["announcement_date"])
-        for ticker, grp in ec.groupby("ticker"):
-            earnings_map[ticker] = grp["announcement_date"].reset_index(drop=True)
-        logger.info("決算カレンダー: %d 銘柄分", len(earnings_map))
-
     features: dict[str, pd.DataFrame] = {}
     for ticker, df in price_data.items():
         try:
             sec_ret = sector_return_map.get(ticker)
-            ed = earnings_map.get(ticker)
             features[ticker] = build_features(
                 ticker, df,
                 sector_returns=sec_ret,
                 market_returns=market_returns,
-                earnings_dates=ed,
                 foreign_flow=foreign_flow_daily,
+                us_market=us_market,
             )
         except Exception as exc:
             logger.warning("%s: 特徴量生成失敗: %s", ticker, exc)
