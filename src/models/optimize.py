@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import multiprocessing
 import os
 import random
 from pathlib import Path
@@ -164,6 +165,31 @@ def _objective(
 
 
 # ---------------------------------------------------------------------------
+# 並列ワーカー（spawn プロセスから呼び出される）
+# ---------------------------------------------------------------------------
+
+def _worker(
+    study_name: str,
+    storage: str,
+    opt_features: dict,
+    lgbm_n_jobs: int,
+    n_trials: int,
+) -> None:
+    """
+    spawn された子プロセス内で study に接続し、n_trials 回の最適化を実行する。
+    fork + OpenMP segfault を回避するため、このプロセスは spawn で起動される。
+    """
+    import optuna as _optuna
+    _optuna.logging.set_verbosity(_optuna.logging.WARNING)
+    _study = _optuna.load_study(study_name=study_name, storage=storage)
+    _study.optimize(
+        lambda trial: _objective(trial, opt_features, lgbm_n_jobs=lgbm_n_jobs),
+        n_trials=n_trials,
+        n_jobs=1,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 最適化の実行
 # ---------------------------------------------------------------------------
 
@@ -261,12 +287,40 @@ def run_optimization(
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-    study.optimize(
-        lambda trial: _objective(trial, opt_features, lgbm_n_jobs=lgbm_n_jobs),
-        n_trials=n_trials,
-        show_progress_bar=(n_jobs == 1),  # 並列時はプログレスバー無効（表示崩れ防止）
-        n_jobs=n_jobs,
-    )
+    if n_jobs <= 1:
+        # シングルプロセス: そのまま実行
+        study.optimize(
+            lambda trial: _objective(trial, opt_features, lgbm_n_jobs=lgbm_n_jobs),
+            n_trials=n_trials,
+            show_progress_bar=True,
+            n_jobs=1,
+        )
+    else:
+        # マルチプロセス: spawn した子プロセスを n_jobs 個起動し、
+        # 各プロセスが同じ SQLite study に n_jobs=1 で接続して並列実行する。
+        # （fork + OpenMP の組み合わせによる segfault を回避するため spawn を使用）
+        logger.info(
+            "並列モード: %d プロセスを spawn して最適化します（study: %s）",
+            n_jobs, storage,
+        )
+        ctx = multiprocessing.get_context("spawn")
+        procs = []
+        for _ in range(n_jobs):
+            p = ctx.Process(
+                target=_worker,
+                args=(study_name, storage, opt_features, lgbm_n_jobs, n_trials),
+                daemon=True,
+            )
+            p.start()
+            procs.append(p)
+        for p in procs:
+            p.join()
+        # join 後に study を再ロードして最新状態を取得
+        study = optuna.load_study(
+            study_name=study_name,
+            storage=storage,
+            sampler=sampler,
+        )
 
     # 結果の保存と表示
     _save_results(study, objective_names)
