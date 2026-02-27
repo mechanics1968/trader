@@ -226,6 +226,17 @@ def build_features(
     # --- Overnight gap の持続性（直近5日の平均ギャップ） ---
     df["gap_ratio_5d_mean"] = df["gap_ratio"].rolling(5).mean()
 
+    # --- ギャップサイズ特徴量 ---
+    gap = df["gap_ratio"]
+    # 絶対値（フィル/モメンタムの閾値判定に有効）
+    df["gap_abs"] = gap.abs()
+    # ATR比ギャップ強度（ギャップが通常の値動き幅に対してどれだけ大きいか）
+    atr_pct = df["atr"] / (close.shift(1) + 1e-9)
+    df["gap_vs_atr"] = (gap / atr_pct.replace(0, np.nan)).clip(-5.0, 5.0)
+    # 市場方向との一致（+1: 追い風ギャップ, -1: 逆張りギャップ）
+    if "mkt_return_1d" in df.columns:
+        df["gap_market_align"] = np.sign(gap) * np.sign(df["mkt_return_1d"].shift(1))
+
     # --- Alpha#6: 始値と出来高の10日相関（逆符号） ---
     # 始値が高いときに出来高が多い = 分布売り → 次日下落シグナル
     df["open_vol_corr_10"] = -df["open"].rolling(10).corr(volume)
@@ -379,6 +390,7 @@ def _add_cross_sectional_ranks(features: dict[str, pd.DataFrame]) -> dict[str, p
         ("amihud_20",       "cs_rank_amihud"),  # 非流動性（Amihud）
         ("volume_ratio_20", "cs_rank_vol20"),   # 出来高異常度
         ("vol_regime",      "cs_rank_volreg"),  # ボラティリティレジーム
+        ("gap_abs",         "gap_abs_rank"),    # ギャップ絶対値（銘柄間相対的な大きさ）
     ]
 
     for src_col, dst_col in rank_targets:

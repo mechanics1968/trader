@@ -30,8 +30,7 @@ from src.models.train import train
 from src.models.predict import predict_next_day
 from src.models.evaluate import evaluate_predictions
 from src.models.optimize import run_optimization, apply_best_params
-from src.models.tft_train import train_tft
-from src.models.tft_predict import predict_next_day_tft
+# tft_train / tft_predict は torch 依存のため遅延 import（spawn 子プロセスのクラッシュ回避）
 from src.strategy.recommend import build_recommendations
 from src.report.output import save_recommendations, print_recommendations
 
@@ -176,6 +175,7 @@ def main() -> None:
             sampled = _random.sample(list(features.keys()), min(args.tft_n_tickers, len(features)))
             tft_features = {k: features[k] for k in sampled}
             logger.info("TFT デバッグモード: %d / %d 銘柄を使用", len(tft_features), len(features))
+        from src.models.tft_train import train_tft
         model_open = train_tft(tft_features, "target_open_return", force=args.retrain)
         model_close = train_tft(tft_features, "target_close_return", force=args.retrain)
     else:
@@ -190,6 +190,7 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     logger.info("[Step 5] 翌日の株価を予測します")
     if args.model == "tft":
+        from src.models.tft_predict import predict_next_day_tft
         predictions = predict_next_day_tft(features, model_open, model_close)
     else:
         predictions = predict_next_day(features, model_open, model_close)
