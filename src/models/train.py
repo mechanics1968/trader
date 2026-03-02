@@ -178,12 +178,19 @@ def _train_single(
         callbacks=callbacks,
     )
 
-    rmse_val = model.best_score.get("valid_0", {}).get("rmse", float("nan"))
+    valid_scores = model.best_score.get("valid_0", {})
+    if "binary_logloss" in valid_scores:
+        val_score = valid_scores["binary_logloss"]
+        score_label = "Logloss(val)"
+    else:
+        val_score = valid_scores.get("rmse", float("nan"))
+        score_label = "RMSE(val)"
     logger.info(
-        "[%s] 最適ラウンド数: %d / RMSE(val): %.6f",
+        "[%s] 最適ラウンド数: %d / %s: %.6f",
         label,
         model.best_iteration,
-        rmse_val,
+        score_label,
+        val_score,
     )
     return model
 
