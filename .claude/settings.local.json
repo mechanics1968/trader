@@ -11,6 +11,9 @@
       "WebFetch(domain:nixtlaverse.nixtla.io)",
       "Bash(ls:*)",
       "Bash(echo:*)",
+      "Bash(cat:*)",
+      "Bash(sleep:*)",
+      "Bash(head:*)",
       "Bash(python:*)",
       "Bash(tee $LOG_FILE:*)",
       "Bash(nvidia-smi:*)",
@@ -18,8 +21,19 @@
       "WebFetch(domain:jpx-jquants.com)",
       "Bash(ps:*)",
       "Bash(grep:*)",
+      "Bash(sed:*)",
       "Bash(source:*)",
-      "Bash(# メインプロセスと子プロセスを全停止 pkill -f \"\"main.py\"\" sleep 2 ps aux)"
+      "Bash(# メインプロセスと子プロセスを全停止 pkill -f \"\"main.py\"\" sleep 2 ps aux)",
+      "Bash(git checkout:*)",
+      "Bash(git pull:*)",
+      "Bash(xargs -r kill -9)",
+      "Bash(stat:*)",
+      "WebFetch(domain:www.marketdata.app)",
+      "Bash(claude:*)",
+      "Bash(strace:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Skill(trader-recommend)"
     ]
   }
 }
