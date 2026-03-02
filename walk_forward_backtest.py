@@ -82,7 +82,19 @@ for d in target_dates:
 print()
 
 # ---------------------------------------------------------------------------
-# 3. ウォークフォワード実行
+# 3. Phase C: 市場方向モデルを全データで1回だけ事前学習
+#    （walk_forward 内で毎日再学習すると非常に遅くなるため）
+# ---------------------------------------------------------------------------
+_market_model = None
+if config.USE_MARKET_MODEL:
+    from src.models.market_model import train_market_model, predict_market_direction
+    from src.features.engineer import _compute_market_returns
+    _market_returns_full = _compute_market_returns(raw_prices)
+    _market_model = train_market_model(_market_returns_full, None, save=False)
+    logger.info("市場方向モデルを事前学習しました（全期間）")
+
+# ---------------------------------------------------------------------------
+# 4. ウォークフォワード実行
 # ---------------------------------------------------------------------------
 daily_results: list[dict] = []
 
@@ -164,17 +176,41 @@ for i, target_date in enumerate(target_dates):
 
     # 推薦銘柄: フィルタ後、期待上昇率の高い上位 TOP_N 件に絞る
     TOP_N = 20
-    _base_filter = (
-        (merged["expected_gain_pct"] >= config.MIN_EXPECTED_GAIN_PCT) &
-        (merged["last_volume"] >= config.MIN_VOLUME) &
-        (merged["last_return_pct"].abs() <= config.MAX_DAILY_CHANGE_PCT)
-    )
 
-    # フィルタなし（市場条件を無視した推薦）
+    # Phase C: 事前学習済み市場方向モデルで翌日の市場上昇確率を取得
+    market_up_prob = 0.5
+    if config.USE_MARKET_MODEL and _market_model is not None:
+        from src.models.market_model import predict_market_direction
+        from src.features.engineer import _compute_market_returns
+        # T-1 までのデータで予測（情報漏洩なし）
+        train_prices_mkt = {t: raw_prices[t][raw_prices[t].index <= prev_date] for t in raw_prices}
+        mkt_ret_pred = _compute_market_returns(train_prices_mkt)
+        market_up_prob = predict_market_direction(mkt_ret_pred, None, model=_market_model)
+
+    # 期待上昇率フィルタ（Phase B/C モードと通常モードで分岐）
+    if config.USE_BINARY_CLOSE and config.USE_INTRADAY_TARGET:
+        _base_filter = (
+            (merged["expected_gain_pct"] > 0) &
+            (merged["last_volume"] >= config.MIN_VOLUME) &
+            (merged["last_return_pct"].abs() <= config.MAX_DAILY_CHANGE_PCT)
+        )
+    else:
+        _base_filter = (
+            (merged["expected_gain_pct"] >= config.MIN_EXPECTED_GAIN_PCT) &
+            (merged["last_volume"] >= config.MIN_VOLUME) &
+            (merged["last_return_pct"].abs() <= config.MAX_DAILY_CHANGE_PCT)
+        )
+
+    # フィルタなし（市場条件を無視した推薦）: Phase B と同じ基準
     rec_nofilter = merged[_base_filter].nlargest(TOP_N, "expected_gain_pct").copy()
 
-    # フィルタあり（市場下落日は推薦しない）
-    mkt_filtered_out = mkt_return_prev < config.MARKET_DECLINE_THRESHOLD * 100
+    # Phase C フィルタ: 市場下落確率が高い日（up_prob < 0.35）は全推薦を除外
+    # up_prob ≈ 0.5 の不確実な日は除外しない（Phase B と同条件を維持）
+    mkt_filtered_out = (
+        config.USE_MARKET_MODEL
+        and _market_model is not None
+        and market_up_prob < 0.35
+    )
     rec = rec_nofilter if not mkt_filtered_out else merged.iloc[:0].copy()
 
     n_rec = len(rec)

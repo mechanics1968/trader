@@ -45,7 +45,17 @@ def predict_next_day(
 
         # 最新行（= 本日のデータ）を使って翌日を予測
         latest = df.iloc[[-1]]
-        feat_cols = get_feature_columns(df)
+        # モデルの学習時の特徴量列を優先使用（列数不一致を防ぐ）
+        if hasattr(model_open, 'feature_name') and callable(model_open.feature_name):
+            feat_cols = model_open.feature_name()
+        else:
+            feat_cols = get_feature_columns(df)
+        # latest に存在しない列は NaN で補完
+        missing = [col for col in feat_cols if col not in latest.columns]
+        if missing:
+            latest = latest.copy()
+            for col in missing:
+                latest[col] = np.nan
         X = latest[feat_cols].replace([np.inf, -np.inf], np.nan)
 
         if X.isna().any(axis=1).values[0]:
@@ -70,35 +80,49 @@ def predict_next_day(
 
         if config.USE_CS_TARGET:
             # CS モード: モデル出力は z-score
-            pred_open  = last_close
-            pred_close = last_close
+            pred_open      = last_close
+            pred_close     = last_close
+            close_up_prob  = float("nan")
             expected_gain_pct = score_close * 100
+        elif config.USE_BINARY_CLOSE and config.USE_INTRADAY_TARGET:
+            # Phase B 分類モード:
+            #   score_open  = 翌日始値超過リターン予測（連続値）
+            #   score_close = 市場超過確率（0〜1）
+            pred_open  = last_close * (1 + score_open)
+            pred_close = float("nan")          # バイナリモードでは終値を円建てで予測しない
+            close_up_prob = score_close        # 市場超過確率（フィルタ・評価に使用）
+            expected_gain_pct = (score_close - 0.5) * 100
         elif config.USE_INTRADAY_TARGET:
             # 日中騰落率モード:
             #   score_open  = 翌日始値の超過リターン予測（前日終値比）
             #   score_close = 翌日日中騰落率予測（始値→終値）
             pred_open  = last_close * (1 + score_open)
             pred_close = pred_open  * (1 + score_close)
-            # 期待利益 = 日中騰落率そのもの
+            close_up_prob = float("nan")
             expected_gain_pct = score_close * 100
         else:
             # Alpha / 絶対リターンモード
             pred_open  = last_close * (1 + score_open)
             pred_close = last_close * (1 + score_close)
+            close_up_prob = float("nan")
             expected_gain_pct = (score_close - score_open) * 100
 
-        rows.append({
+        row: dict = {
             "ticker": ticker,
             "last_close": round(last_close, 1),
             "last_volume": int(last_volume),
             "last_return_pct": round(last_return * 100, 2),
             "last_mkt_return": round(last_mkt_return * 100, 4),
             "pred_open": round(pred_open, 1),
-            "pred_close": round(pred_close, 1),
             "pred_open_return_pct": round(score_open * 100, 2),
-            "pred_close_return_pct": round(score_close * 100, 2),
             "expected_gain_pct": round(expected_gain_pct, 2),
-        })
+        }
+        if np.isnan(pred_close):
+            row["close_up_prob"] = round(close_up_prob, 4)
+        else:
+            row["pred_close"] = round(pred_close, 1)
+            row["pred_close_return_pct"] = round(score_close * 100, 2)
+        rows.append(row)
 
     result = pd.DataFrame(rows)
     logger.info("予測完了: %d 銘柄", len(result))

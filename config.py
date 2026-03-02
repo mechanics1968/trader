@@ -102,6 +102,18 @@ MARKET_DECLINE_THRESHOLD: float = -1.0
 # False: target_alpha_* （残差リターン）をそのまま使用
 USE_CS_TARGET: bool = False      # CS z-score は絶対勝率を改善しないため無効化（実験済み）
 USE_INTRADAY_TARGET: bool = True  # 終値モデルのターゲットを日中騰落率（始値→終値）に変更
+USE_INTRADAY_ALPHA: bool = True   # 終値モデルのターゲットを日中αリターン（日中騰落率 - 市場日中騰落率）に変更
+                                  # ベータ依存性排除のための主要フラグ。USE_INTRADAY_TARGET=True が前提
+USE_BINARY_CLOSE: bool = True     # Phase B: 終値モデルを2値分類（市場超過か否か）に変更
+                                  # target_intraday_alpha > 0 を正例として binary logloss で学習
+USE_MARKET_MODEL: bool = True     # Phase C: 市場方向予測モデルを使って推薦レーティングを算出
+# MARKET_DOWN_THRESHOLD: float = 0.45   # (廃止) 市場下落確率がこれを超えたら推薦閾値を引き上げ
+# MARKET_HIGH_PROB_THRESHOLD: float = 0.65  # (廃止) 市場下落局面での高確信度閾値
+MARKET_RATING_MARKET_WEIGHT: float = 0.5   # ★算出時の市場動向の重み（0=個別スコアのみ、1=市場のみ）
+MARKET_RATING_THRESHOLDS: list[float] = [0.25, 0.40, 0.60, 0.75]  # composite → ★1〜5 境界値
+USE_LLM_SENTIMENT: bool = True    # Phase D: Claude CLI による市場センチメント分析を有効化
+LLM_SENTIMENT_WEIGHT: float = 0.5 # LLMセンチメントと市場モデルの合成比率（0=モデルのみ、1=LLMのみ）
+LLM_RISK_TICKER_EXCLUDE: bool = True  # LLMが指定したリスク銘柄を推薦から除外する
 
 # ---------------------------------------------------------------------------
 # モデル（TFT: Temporal Fusion Transformer）

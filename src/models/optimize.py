@@ -20,9 +20,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import multiprocessing
+import math
 import os
+import pickle
 import random
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 import optuna
@@ -165,34 +169,36 @@ def _objective(
 
 
 # ---------------------------------------------------------------------------
-# 並列ワーカー（spawn プロセスから呼び出される）
+# 並列ワーカー（subprocess として起動される）
 # ---------------------------------------------------------------------------
 
-def _worker(
+def _run_worker(
     study_name: str,
     storage: str,
-    opt_features: dict,
+    features_pkl: str,
     lgbm_n_jobs: int,
     n_trials: int,
 ) -> None:
     """
-    spawn された子プロセス内で study に接続し、n_trials 回の最適化を実行する。
-    fork + OpenMP segfault を回避するため、このプロセスは spawn で起動される。
+    SQLite study に接続して n_trials 回の最適化を実行するワーカー関数。
+    __main__ == "src.models.optimize" の文脈で呼び出される。
     """
-    import optuna as _optuna
-    _optuna.logging.set_verbosity(_optuna.logging.WARNING)
-    _study = _optuna.create_study(
+    with open(features_pkl, "rb") as f:
+        opt_features = pickle.load(f)
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(
         study_name=study_name,
         storage=storage,
         load_if_exists=True,
         directions=["minimize", "minimize", "minimize", "minimize", "minimize"],
-        sampler=_optuna.samplers.NSGAIISampler(seed=42),
+        sampler=optuna.samplers.NSGAIISampler(seed=42),
     )
-    _study.optimize(
+    study.optimize(
         lambda trial: _objective(trial, opt_features, lgbm_n_jobs=lgbm_n_jobs),
         n_trials=n_trials,
         n_jobs=1,
-        catch=(Exception,),  # 子プロセス内の例外を FAIL 状態にして継続
+        catch=(Exception,),
     )
 
 
@@ -305,26 +311,40 @@ def run_optimization(
             n_jobs=1,
         )
     else:
-        # マルチプロセス: spawn した子プロセスを n_jobs 個起動し、
-        # 各プロセスが同じ SQLite study に n_jobs=1 で接続して並列実行する。
-        # （fork + OpenMP の組み合わせによる segfault を回避するため spawn を使用）
+        # マルチプロセス: subprocess で python -m src.models.optimize --worker を起動
+        # 各ワーカーに ceil(n_trials / n_jobs) trial を割り当てて合計が n_trials になるよう調整
+        trials_per_worker = math.ceil(n_trials / n_jobs)
         logger.info(
-            "並列モード: %d プロセスを spawn して最適化します（study: %s）",
-            n_jobs, storage,
+            "並列モード: %d サブプロセスを起動します（各 %d trials / 合計 ~%d trials）",
+            n_jobs, trials_per_worker, n_jobs * trials_per_worker,
         )
-        ctx = multiprocessing.get_context("spawn")
-        procs = []
-        for _ in range(n_jobs):
-            p = ctx.Process(
-                target=_worker,
-                args=(study_name, storage, opt_features, lgbm_n_jobs, n_trials),
-                daemon=True,
-            )
-            p.start()
-            procs.append(p)
-        for p in procs:
-            p.join()
-        # join 後に study を再ロードして最新状態を取得
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".pkl", delete=False, prefix="trader_opt_"
+        ) as tf:
+            features_pkl = tf.name
+        with open(features_pkl, "wb") as f:
+            pickle.dump(opt_features, f)
+
+        cmd_base = [
+            sys.executable, "-m", "src.models.optimize",
+            "--worker",
+            "--study-name", study_name,
+            "--storage", storage,
+            "--features-pkl", features_pkl,
+            "--lgbm-n-jobs", str(lgbm_n_jobs),
+            "--n-trials", str(trials_per_worker),
+        ]
+        try:
+            procs = [
+                subprocess.Popen(cmd_base, cwd=str(config.BASE_DIR))
+                for _ in range(n_jobs)
+            ]
+            for p in procs:
+                p.wait()
+        finally:
+            os.unlink(features_pkl)
+
         study = optuna.load_study(
             study_name=study_name,
             storage=storage,
@@ -503,21 +523,39 @@ def _parse_args() -> argparse.Namespace:
         "--apply", action="store_true",
         help="最適化後に推薦パラメータで本番モデルを再学習する"
     )
+    # 内部ワーカーモード（run_optimization から subprocess で起動される）
+    p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--study-name", type=str, default="trader_lgbm", help=argparse.SUPPRESS)
+    p.add_argument("--features-pkl", type=str, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--lgbm-n-jobs", type=int, default=1, help=argparse.SUPPRESS)
     return p.parse_args()
 
 
 if __name__ == "__main__":
-    import sys
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.WARNING,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
     args = _parse_args()
 
-    # 特徴量をすべてロード
-    import os
+    # ---- ワーカーモード（run_optimization から subprocess で起動）----
+    if args.worker:
+        if args.features_pkl is None or args.storage is None:
+            print("--worker には --features-pkl と --storage が必要です", file=sys.stderr)
+            sys.exit(1)
+        _run_worker(
+            study_name=args.study_name,
+            storage=args.storage,
+            features_pkl=args.features_pkl,
+            lgbm_n_jobs=args.lgbm_n_jobs,
+            n_trials=args.n_trials,
+        )
+        sys.exit(0)
+
+    # ---- 通常モード ----
+    logging.getLogger().setLevel(logging.INFO)
     from src.features.engineer import load_processed
 
     logger.info("特徴量を読み込みます ...")

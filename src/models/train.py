@@ -78,7 +78,22 @@ def train(
         label_open = "始値"
         logger.warning("残差ターゲット列が見つかりません。通常ターゲットにフォールバックします")
 
-    if "target_intraday_return" in combined.columns:
+    # Phase B: 2値分類モード（市場超過か否か）
+    is_binary_close = (
+        config.USE_BINARY_CLOSE
+        and config.USE_INTRADAY_ALPHA
+        and "target_intraday_alpha" in combined.columns
+    )
+
+    if is_binary_close:
+        y_close     = (combined["target_intraday_alpha"] > 0).astype(int)
+        label_close = "日中α2値"
+        logger.info("Phase B: 終値モデルを2値分類（市場超過=1 / 以下=0）に変更します")
+    elif config.USE_INTRADAY_ALPHA and "target_intraday_alpha" in combined.columns:
+        y_close     = combined["target_intraday_alpha"]
+        label_close = "日中αリターン"
+        logger.info("日中αリターン（市場超過）を終値モデルのターゲットとして使用します")
+    elif "target_intraday_return" in combined.columns:
         y_close     = combined["target_intraday_return"]
         label_close = "日中騰落率"
         logger.info("日中騰落率を終値モデルのターゲットとして使用します")
@@ -89,11 +104,17 @@ def train(
         y_close     = combined["target_close_return"]
         label_close = "終値"
 
+    # 分類モード用に params を上書き（始値モデルは回帰のまま）
+    close_params = dict(params) if params is not None else dict(config.LGBM_PARAMS)
+    if is_binary_close:
+        close_params["objective"] = "binary"
+        close_params["metric"]    = "binary_logloss"
+
     date_col = combined["date"] if "date" in combined.columns else None
     model_open = _train_single(X, y_open, label=label_open, params=params,
                                num_rounds=num_rounds, early_stopping=early_stopping,
                                date_col=date_col)
-    model_close = _train_single(X, y_close, label=label_close, params=params,
+    model_close = _train_single(X, y_close, label=label_close, params=close_params,
                                 num_rounds=num_rounds, early_stopping=early_stopping,
                                 date_col=date_col)
 

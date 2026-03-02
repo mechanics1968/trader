@@ -271,12 +271,27 @@ def build_features(
     # ------------------------------------------------------------------ #
     # ターゲット変数
     # ------------------------------------------------------------------ #
+    _TARGET_CLIP = 0.20  # ターゲット変化率の上限（±20%）: close≈0 の銘柄の除算爆発を防ぐ
+    _safe_close = close.replace(0, np.nan)
+    _safe_open_next = df["open"].shift(-1).replace(0, np.nan)
+    _safe_close_next = close.shift(-1)
+
     # 翌日の始値変化率（前日終値比）
-    df["target_open_return"] = df["open"].shift(-1) / close - 1
+    df["target_open_return"] = (_safe_open_next / _safe_close - 1).clip(-_TARGET_CLIP, _TARGET_CLIP)
     # 翌日の終値変化率（前日終値比）
-    df["target_close_return"] = close.shift(-1) / close - 1
+    df["target_close_return"] = (_safe_close_next / _safe_close - 1).clip(-_TARGET_CLIP, _TARGET_CLIP)
     # 翌日の日中騰落率（始値→終値）— デイトレの実損益に直結する予測ターゲット
-    df["target_intraday_return"] = close.shift(-1) / df["open"].shift(-1) - 1
+    df["target_intraday_return"] = (_safe_close_next / _safe_open_next - 1).clip(-_TARGET_CLIP, _TARGET_CLIP)
+
+    # 市場日中リターンを前日値として特徴量に追加（ルックアヘッドなし）
+    if market_returns is not None and "mkt_intraday_return" in market_returns.columns:
+        mkt_intraday = market_returns["mkt_intraday_return"].reindex(df.index)
+        df["mkt_intraday_return"] = mkt_intraday.shift(1)  # 前日の市場日中リターン（特徴量）
+
+        # 日中αターゲット: 翌日の個別銘柄日中騰落率 - 翌日の市場日中騰落率
+        # ベータ依存性を排除し、銘柄固有の動きを直接予測する
+        mkt_intraday_next = mkt_intraday.shift(-1)  # 翌日の市場日中リターン（ターゲット用）
+        df["target_intraday_alpha"] = df["target_intraday_return"] - mkt_intraday_next
 
     # 残差ターゲット変数（市場ベータを除去した超過リターン）
     # 翌日（T+1）の市場リターンをベータ分だけ引いてアルファ成分を抽出する。
@@ -364,6 +379,7 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
     exclude = {
         "open", "high", "low", "close", "volume",
         "target_open_return", "target_close_return", "target_intraday_return",
+        "target_intraday_alpha",
         "target_alpha_open", "target_alpha_close",
         "target_cs_open", "target_cs_close",
         "ticker", "date",
@@ -427,21 +443,31 @@ def _compute_market_returns(
     price_data: dict[str, pd.DataFrame],
 ) -> pd.DataFrame:
     """
-    全銘柄の終値から等加重市場平均リターンを計算して返す。
+    全銘柄の終値・始値から等加重市場平均リターンを計算して返す。
 
     Returns
     -------
     pd.DataFrame
-        列: mkt_return_1d, mkt_return_5d（インデックス: date）
+        列: mkt_return_1d, mkt_return_5d, mkt_intraday_return（インデックス: date）
     """
     close_df = pd.DataFrame({t: d["close"] for t, d in price_data.items()})
+    open_df  = pd.DataFrame({t: d["open"]  for t, d in price_data.items()})
     ret_1d_raw = close_df.pct_change(1, fill_method=None)
     ret_5d_raw = close_df.pct_change(5, fill_method=None)
     # ±50% 超の外れ値（データ異常・上場廃止等）を除外してから平均
     clip = 0.50
     ret_1d = ret_1d_raw.where(ret_1d_raw.abs() <= clip).mean(axis=1)
     ret_5d = ret_5d_raw.where(ret_5d_raw.abs() <= clip).mean(axis=1)
-    return pd.DataFrame({"mkt_return_1d": ret_1d, "mkt_return_5d": ret_5d})
+    # 市場の日中リターン（始値→終値の等加重平均）
+    # ストップ高/安（±20%超）は除外
+    intraday_raw = (close_df / open_df.replace(0, np.nan) - 1)
+    intraday_clip = 0.20
+    mkt_intraday = intraday_raw.where(intraday_raw.abs() <= intraday_clip).mean(axis=1)
+    return pd.DataFrame({
+        "mkt_return_1d": ret_1d,
+        "mkt_return_5d": ret_5d,
+        "mkt_intraday_return": mkt_intraday,
+    })
 
 
 def _compute_sector_returns(

@@ -186,6 +186,58 @@ def main() -> None:
         model_open, model_close = train(features, force=args.retrain)
 
     # ------------------------------------------------------------------ #
+    # Step 4c: Phase C 市場方向モデルの学習
+    # ------------------------------------------------------------------ #
+    market_up_prob = 0.5  # デフォルト中立
+    if config.USE_MARKET_MODEL:
+        from src.models.market_model import train_market_model, predict_market_direction
+        from src.features.engineer import _compute_market_returns
+        logger.info("[Step 4c] 市場方向モデルを学習します")
+        market_returns = _compute_market_returns(price_data)
+        market_model = train_market_model(market_returns, us_market, save=True)
+        if market_model is not None:
+            market_up_prob = predict_market_direction(market_returns, us_market, model=market_model)
+            logger.info("翌日市場予測: 上昇確率=%.3f / 下落確率=%.3f", market_up_prob, 1 - market_up_prob)
+
+    # ------------------------------------------------------------------ #
+    # Step 4d: Phase D — Claude CLI による市場センチメント分析
+    # ------------------------------------------------------------------ #
+    llm_sentiment_result: dict = {
+        "market_sentiment": 0.0,
+        "confidence": 0.0,
+        "risk_tickers": [],
+        "reasoning": "未実行",
+    }
+    if config.USE_LLM_SENTIMENT:
+        from src.fetch.llm_sentiment import get_llm_sentiment
+        logger.info("[Step 4d] Claude CLI で市場センチメントを分析します")
+        # 当日の市場数値を整理
+        mkt_data: dict = {}
+        if us_market is not None and not us_market.empty:
+            last = us_market.iloc[-1]
+            mkt_data["sp500_ret"] = float(last.get("sp500_ret", 0) * 100)
+            mkt_data["vix"] = float(last.get("vix_level", 0))
+            mkt_data["usdjpy"] = float(last.get("usdjpy_level", 0))
+        llm_sentiment_result = get_llm_sentiment(market_data=mkt_data)
+        logger.info(
+            "LLMセンチメント: %.2f (確信度: %.2f) — %s",
+            llm_sentiment_result["market_sentiment"],
+            llm_sentiment_result["confidence"],
+            llm_sentiment_result["reasoning"],
+        )
+        # LLM センチメントと市場モデルの合成
+        # sentiment: -1〜1 → market_up_prob: 0〜1 に変換
+        llm_up_prob = (llm_sentiment_result["market_sentiment"] + 1.0) / 2.0
+        llm_confidence = llm_sentiment_result["confidence"]
+        if llm_confidence > 0:
+            w = config.LLM_SENTIMENT_WEIGHT * llm_confidence
+            market_up_prob = (1 - w) * market_up_prob + w * llm_up_prob
+            logger.info(
+                "合成後 market_up_prob: %.3f (LLM重み: %.2f)",
+                market_up_prob, w,
+            )
+
+    # ------------------------------------------------------------------ #
     # Step 5: 翌日予測
     # ------------------------------------------------------------------ #
     logger.info("[Step 5] 翌日の株価を予測します")
@@ -213,7 +265,11 @@ def main() -> None:
     # Step 8: 推薦銘柄リスト生成
     # ------------------------------------------------------------------ #
     logger.info("[Step 8] 推薦銘柄リストを生成します")
-    recommendations = build_recommendations(predictions, ticker_info, lot_sizes)
+    recommendations = build_recommendations(
+        predictions, ticker_info, lot_sizes,
+        market_up_prob=market_up_prob,
+        risk_tickers=llm_sentiment_result.get("risk_tickers", []),
+    )
 
     # ------------------------------------------------------------------ #
     # Step 9: 出力
