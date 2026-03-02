@@ -189,7 +189,7 @@ def _extract_foreign_net(raw: pd.DataFrame) -> pd.DataFrame | None:
     for i, row in raw.iterrows():
         vals = row.dropna().values
         try:
-            dates = pd.to_datetime(vals, errors="coerce")
+            dates = pd.to_datetime(vals, errors="coerce", format="mixed")
             if dates.notna().sum() >= 5:
                 date_row_idx = i
                 break
