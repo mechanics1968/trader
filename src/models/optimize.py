@@ -153,13 +153,10 @@ def _objective(
         n_recs = _count_recommendations(features, model_open, model_close)
 
         objs = errors.objectives
-        return (
-            objs["rmse_open"],
-            objs["rmse_close"],
-            objs["1_minus_dir_acc_open"],
-            objs["1_minus_dir_acc_close"],
-            -float(n_recs),  # 負値 = 推薦数最大化
-        )
+        # objectives のキーはモードによって異なるため values() の順で返す
+        # USE_BINARY_CLOSE=True : rmse_open, 1_minus_auc_close, 1_minus_dir_acc_open, 1_minus_dir_acc_close
+        # USE_BINARY_CLOSE=False: rmse_open, rmse_close,         1_minus_dir_acc_open, 1_minus_dir_acc_close
+        return tuple(list(objs.values()) + [-float(n_recs)])
 
     except optuna.TrialPruned:
         raise
