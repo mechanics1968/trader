@@ -159,14 +159,23 @@ for i, target_date in enumerate(target_dates):
         (merged["actual_close"] - merged["actual_open"]) / merged["actual_open"] * 100
     )
 
-    open_acc  = (np.sign(merged["pred_open_return_pct"])  == np.sign(merged["actual_open_return_pct"])).mean()
-    close_acc = (np.sign(merged["pred_close_return_pct"]) == np.sign(merged["actual_close_return_pct"])).mean()
-    eg_acc    = (np.sign(merged["expected_gain_pct"])     == np.sign(merged["actual_gain_pct"])).mean()
+    open_acc  = (np.sign(merged["pred_open_return_pct"]) == np.sign(merged["actual_open_return_pct"])).mean()
+    # バイナリモードでは pred_close_return_pct の代わりに close_up_prob（確率-0.5 の符号）で方向判定
+    if "pred_close_return_pct" in merged.columns:
+        close_pred_dir = merged["pred_close_return_pct"]
+        rmse_close = np.sqrt(((merged["pred_close_return_pct"] - merged["actual_close_return_pct"].clip(-50, 50))**2).mean())
+    elif "close_up_prob" in merged.columns:
+        close_pred_dir = merged["close_up_prob"] - 0.5   # >0 なら上昇予測
+        rmse_close = float("nan")
+    else:
+        close_pred_dir = merged["expected_gain_pct"]
+        rmse_close = float("nan")
+    close_acc = (np.sign(close_pred_dir) == np.sign(merged["actual_close_return_pct"])).mean()
+    eg_acc    = (np.sign(merged["expected_gain_pct"]) == np.sign(merged["actual_gain_pct"])).mean()
 
     # 市場全体リターン（±50% 超の異常値を除外して計算）
     mkt_open  = merged["actual_open_return_pct"].clip(-50, 50).mean()
     mkt_close = merged["actual_close_return_pct"].clip(-50, 50).mean()
-    rmse_close = np.sqrt(((merged["pred_close_return_pct"] - merged["actual_close_return_pct"].clip(-50, 50))**2).mean())
 
     # 前日の等加重市場リターン（recommendations の市場フィルタ用）
     mkt_return_prev = (
