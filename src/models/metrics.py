@@ -33,18 +33,27 @@ class PredictionErrors:
 
     # --- スカラー指標 ---
     rmse_open: float = float("nan")       # 始値変化率 RMSE
-    rmse_close: float = float("nan")      # 終値変化率 RMSE
+    rmse_close: float = float("nan")      # 終値変化率 RMSE（バイナリモードでは nan）
     rmse_gain: float = float("nan")       # 期待利益幅（close-open）RMSE
     dir_acc_open: float = float("nan")    # 始値方向的中率  (0〜1, 高いほど良い)
     dir_acc_close: float = float("nan")   # 終値方向的中率  (0〜1, 高いほど良い)
+    auc_close: float = float("nan")       # 終値バイナリAUC（USE_BINARY_CLOSE=True 時のみ有効）
     mae_open: float = float("nan")        # 始値変化率 MAE
-    mae_close: float = float("nan")       # 終値変化率 MAE
+    mae_close: float = float("nan")       # 終値変化率 MAE（バイナリモードでは nan）
     n_samples: int = 0                    # 評価に使ったサンプル数
 
     # --- 多目的最適化の目的関数値（最小化方向に統一）---
-    # Optuna はデフォルトで minimize なので方向的中率は (1 - 値) で返す
+    # Optuna はデフォルトで minimize なので方向的中率・AUC は (1 - 値) で返す
+    # USE_BINARY_CLOSE=True の場合、rmse_close は意味をなさないため auc_close で代替する
     @property
     def objectives(self) -> dict[str, float]:
+        if config.USE_BINARY_CLOSE:
+            return {
+                "rmse_open": self.rmse_open,
+                "1_minus_auc_close": 1.0 - self.auc_close,
+                "1_minus_dir_acc_open": 1.0 - self.dir_acc_open,
+                "1_minus_dir_acc_close": 1.0 - self.dir_acc_close,
+            }
         return {
             "rmse_open": self.rmse_open,
             "rmse_close": self.rmse_close,
@@ -149,16 +158,32 @@ def compute_errors(
     a_gain = a_close - a_open
     p_gain = p_close - p_open
 
-    errors = PredictionErrors(
-        rmse_open=_rmse(a_open, p_open),
-        rmse_close=_rmse(a_close, p_close),
-        rmse_gain=_rmse(a_gain, p_gain),
-        dir_acc_open=_dir_acc(a_open, p_open),
-        dir_acc_close=_dir_acc(a_close, p_close),
-        mae_open=_mae(a_open, p_open),
-        mae_close=_mae(a_close, p_close),
-        n_samples=len(a_open),
-    )
+    if config.USE_BINARY_CLOSE:
+        # closeモデルは確率値（0〜1）を予測するバイナリ分類器なので
+        # RMSEは意味をなさない。AUCで代替する。
+        auc_close = _auc(a_close, p_close)
+        errors = PredictionErrors(
+            rmse_open=_rmse(a_open, p_open),
+            rmse_close=float("nan"),
+            rmse_gain=float("nan"),
+            dir_acc_open=_dir_acc(a_open, p_open),
+            dir_acc_close=float(np.mean(p_close >= 0.5) if len(p_close) else float("nan")),
+            auc_close=auc_close,
+            mae_open=_mae(a_open, p_open),
+            mae_close=float("nan"),
+            n_samples=len(a_open),
+        )
+    else:
+        errors = PredictionErrors(
+            rmse_open=_rmse(a_open, p_open),
+            rmse_close=_rmse(a_close, p_close),
+            rmse_gain=_rmse(a_gain, p_gain),
+            dir_acc_open=_dir_acc(a_open, p_open),
+            dir_acc_close=_dir_acc(a_close, p_close),
+            mae_open=_mae(a_open, p_open),
+            mae_close=_mae(a_close, p_close),
+            n_samples=len(a_open),
+        )
 
     _log_summary(errors)
     return errors
@@ -257,6 +282,18 @@ def _dir_acc(actual: np.ndarray, pred: np.ndarray) -> float:
     return float(np.mean(np.sign(actual) == np.sign(pred)))
 
 
+def _auc(actual: np.ndarray, pred_prob: np.ndarray) -> float:
+    """2値ラベル（actual > 0 を正例）と予測確率の ROC-AUC を返す。"""
+    try:
+        from sklearn.metrics import roc_auc_score
+        labels = (actual > 0).astype(int)
+        if labels.sum() == 0 or labels.sum() == len(labels):
+            return float("nan")
+        return float(roc_auc_score(labels, pred_prob))
+    except Exception:
+        return float("nan")
+
+
 def _compute_errors_tft(
     features: dict[str, pd.DataFrame],
     model_open,
@@ -317,13 +354,23 @@ def _compute_errors_per_day_tft(
 
 
 def _log_summary(e: PredictionErrors) -> None:
-    logger.info(
-        "予測誤差サマリ (n=%d)\n"
-        "  始値 RMSE=%.6f  MAE=%.6f  方向的中率=%.3f\n"
-        "  終値 RMSE=%.6f  MAE=%.6f  方向的中率=%.3f\n"
-        "  利益幅 RMSE=%.6f",
-        e.n_samples,
-        e.rmse_open, e.mae_open, e.dir_acc_open,
-        e.rmse_close, e.mae_close, e.dir_acc_close,
-        e.rmse_gain,
-    )
+    if config.USE_BINARY_CLOSE:
+        logger.info(
+            "予測誤差サマリ (n=%d)\n"
+            "  始値 RMSE=%.6f  MAE=%.6f  方向的中率=%.3f\n"
+            "  終値(バイナリ) AUC=%.4f  的中率=%.3f",
+            e.n_samples,
+            e.rmse_open, e.mae_open, e.dir_acc_open,
+            e.auc_close, e.dir_acc_close,
+        )
+    else:
+        logger.info(
+            "予測誤差サマリ (n=%d)\n"
+            "  始値 RMSE=%.6f  MAE=%.6f  方向的中率=%.3f\n"
+            "  終値 RMSE=%.6f  MAE=%.6f  方向的中率=%.3f\n"
+            "  利益幅 RMSE=%.6f",
+            e.n_samples,
+            e.rmse_open, e.mae_open, e.dir_acc_open,
+            e.rmse_close, e.mae_close, e.dir_acc_close,
+            e.rmse_gain,
+        )

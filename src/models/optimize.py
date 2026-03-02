@@ -286,13 +286,23 @@ def run_optimization(
         load_if_exists=(storage is not None),
     )
 
-    objective_names = [
-        "rmse_open",
-        "rmse_close",
-        "1_minus_dir_acc_open",
-        "1_minus_dir_acc_close",
-        "neg_n_recommendations",  # 負値（小さいほど推薦数が多い）
-    ]
+    # USE_BINARY_CLOSE=True の場合、closeモデルはRMSEではなくAUCで評価する
+    if config.USE_BINARY_CLOSE:
+        objective_names = [
+            "rmse_open",
+            "1_minus_auc_close",        # AUC最大化 → (1-AUC)最小化
+            "1_minus_dir_acc_open",
+            "1_minus_dir_acc_close",
+            "neg_n_recommendations",
+        ]
+    else:
+        objective_names = [
+            "rmse_open",
+            "rmse_close",
+            "1_minus_dir_acc_open",
+            "1_minus_dir_acc_close",
+            "neg_n_recommendations",    # 負値（小さいほど推薦数が多い）
+        ]
     study.set_metric_names(objective_names)
 
     logger.info(
@@ -429,7 +439,11 @@ def _select_best_params(
 
     score_col = "score"
     pool = pool.copy()
-    pool[score_col] = pool["obj_rmse_open"] + pool["obj_rmse_close"]
+    if config.USE_BINARY_CLOSE:
+        # バイナリモード: rmse_open + (1-AUC) を最小化
+        pool[score_col] = pool["obj_rmse_open"] + pool["obj_1_minus_auc_close"]
+    else:
+        pool[score_col] = pool["obj_rmse_open"] + pool["obj_rmse_close"]
     best_row = pool.loc[pool[score_col].idxmin()]
 
     # param_ プレフィックスを除いて返す
