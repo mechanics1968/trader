@@ -409,6 +409,9 @@ def _add_cross_sectional_ranks(features: dict[str, pd.DataFrame]) -> dict[str, p
         ("gap_abs",         "gap_abs_rank"),    # ギャップ絶対値（銘柄間相対的な大きさ）
     ]
 
+    # 銘柄ごとに追加する列を蓄積し、最後に pd.concat で一括結合して断片化を防ぐ
+    new_cols: dict[str, dict[str, pd.Series]] = {ticker: {} for ticker in features}
+
     for src_col, dst_col in rank_targets:
         # 日付×銘柄のワイドフォーマットに変換
         wide = pd.DataFrame(
@@ -422,7 +425,15 @@ def _add_cross_sectional_ranks(features: dict[str, pd.DataFrame]) -> dict[str, p
 
         for ticker in features:
             if ticker in cs_rank.columns:
-                features[ticker][dst_col] = cs_rank[ticker].reindex(features[ticker].index)
+                new_cols[ticker][dst_col] = cs_rank[ticker].reindex(features[ticker].index)
+
+    # 全銘柄に新列を一括結合（断片化回避）
+    for ticker, cols in new_cols.items():
+        if cols:
+            features[ticker] = pd.concat(
+                [features[ticker], pd.DataFrame(cols, index=features[ticker].index)],
+                axis=1,
+            )
 
     return features
 
