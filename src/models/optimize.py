@@ -342,13 +342,32 @@ def run_optimization(
             "--lgbm-n-jobs", str(lgbm_n_jobs),
             "--n-trials", str(trials_per_worker),
         ]
+        log_files = [f"/tmp/trader_worker_{i}.log" for i in range(n_jobs)]
         try:
             procs = [
-                subprocess.Popen(cmd_base, cwd=str(config.BASE_DIR))
-                for _ in range(n_jobs)
+                subprocess.Popen(
+                    cmd_base,
+                    cwd=str(config.BASE_DIR),
+                    env=os.environ.copy(),
+                    stdout=open(log_files[i], "w"),
+                    stderr=subprocess.STDOUT,
+                )
+                for i in range(n_jobs)
             ]
-            for p in procs:
-                p.wait()
+            # 30秒ごとに完了Trial数をログ出力して進捗を可視化
+            import time as _time
+            while any(p.poll() is None for p in procs):
+                _time.sleep(30)
+                try:
+                    _s = optuna.load_study(study_name=study_name, storage=storage)
+                    done = sum(1 for t in _s.trials if t.state == optuna.trial.TrialState.COMPLETE)
+                    logger.info("最適化進捗: %d / %d trials 完了", done, n_jobs * trials_per_worker)
+                except Exception:
+                    pass
+            for i, p in enumerate(procs):
+                if p.returncode != 0:
+                    with open(log_files[i]) as lf:
+                        logger.error("ワーカー%d がエラー終了 (returncode=%d):\n%s", i, p.returncode, lf.read())
         finally:
             os.unlink(features_pkl)
 
