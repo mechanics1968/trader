@@ -54,6 +54,24 @@ OPT_EARLY_STOPPING = None  # None = Early Stopping 無効
 
 
 # ---------------------------------------------------------------------------
+# ユーティリティ
+# ---------------------------------------------------------------------------
+
+def _get_apple_p_core_count() -> int | None:
+    """Apple Silicon の P コア（高性能コア）数を返す。非 Apple Silicon では None。"""
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "hw.perflevel0.logicalcpu"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 探索空間の定義
 # ---------------------------------------------------------------------------
 
@@ -247,10 +265,20 @@ def run_optimization(
     else:
         opt_features = features
 
-    # 並列 Trial 数に応じて LightGBM の per-Trial スレッド数を決定
-    # 例: 8コア / n_jobs=4 → 各 Trial に 2 スレッド → 合計 8 コアをフル活用
+    # Apple Silicon の P コア数を取得（取得できなければ全論理コアを使用）
+    # n_jobs が明示指定されていない（=1のデフォルト）かつ P コアが取得できた場合のみ自動設定
+    p_core_count = _get_apple_p_core_count()
     cpu_count = os.cpu_count() or 4
-    lgbm_n_jobs = max(1, cpu_count // max(1, n_jobs))
+    if p_core_count and n_jobs == 1:
+        # デフォルト時: P コア数をそのまま n_jobs に使い、LightGBM は 1 スレッドに固定
+        n_jobs = p_core_count
+        lgbm_n_jobs = 1
+        logger.info(
+            "Apple Silicon 検出: P コア=%d → n_jobs=%d / LightGBM スレッド=1 に自動設定",
+            p_core_count, n_jobs,
+        )
+    else:
+        lgbm_n_jobs = max(1, cpu_count // max(1, n_jobs))
 
     # fork + OpenMP の競合による segfault 対策
     # LightGBM が内部で使う OpenMP スレッド数を明示的に制限する
