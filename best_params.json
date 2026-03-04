@@ -1,12 +1,16 @@
 {
-  "learning_rate": 0.26690431824362526,
-  "num_leaves": 140,
-  "max_depth": 3,
-  "min_child_samples": 56,
-  "min_gain_to_split": 7.312812825322083e-06,
-  "feature_fraction": 0.5425825263954398,
-  "bagging_fraction": 0.9774683769652668,
-  "bagging_freq": 2,
-  "lambda_l1": 0.0020798714270728416,
-  "lambda_l2": 0.023585940584142682
+  "learning_rate": 0.2063696403063293,
+  "num_leaves": 96,
+  "max_depth": 6,
+  "min_child_samples": 18,
+  "min_gain_to_split": 5.978368847178422e-07,
+  "feature_fraction": 0.5463937860274501,
+  "bagging_fraction": 0.9838063328514673,
+  "bagging_freq": 4,
+  "lambda_l1": 1.0676256433841842,
+  "lambda_l2": 0.002077300593178723,
+  "objective": "regression",
+  "metric": "rmse",
+  "verbose": -1,
+  "n_jobs": -1
 }
